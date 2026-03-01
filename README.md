@@ -116,6 +116,10 @@ Every decision is logged to `termiclaude.jsonl` (one JSON object per line):
 {"ts": "2026-03-01T15:02:00", "event": "intervene", "type": "message", "message": "Focus on the login bug", "intervention_count": 1}
 ```
 
+## E2E Guide
+
+See **[E2E_GUIDE.md](E2E_GUIDE.md)** for complete walkthroughs: simple tasks, supervised sessions, overnight autonomy, parallel agents, and a ready-to-run demo project.
+
 ## Safety
 
 - Pattern matching only sends Enter/y — never destructive input
