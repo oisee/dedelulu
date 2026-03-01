@@ -13,12 +13,27 @@ pip install -e .
 ## Quick start
 
 ```bash
-cd ~/your-project
+pip install -e .
+
+# Just auto-approve everything — no API keys needed
 termiclaude claude "add tests for the auth module"
+
+# With supervisor — watches for derailing (needs ollama)
+termiclaude --provider ollama claude "add tests for the auth module"
 ```
 
-That's it. termiclaude wraps Claude Code, auto-approves tool permissions,
+That's it. Open a terminal, cd to your project, run the command.
+termiclaude wraps Claude Code, auto-approves tool permissions,
 and logs every decision to `termiclaude.jsonl`.
+
+## Try it now
+
+```bash
+mkdir -p /tmp/termiclaude-demo && cd /tmp/termiclaude-demo
+termiclaude claude "Create a Flask CRUD API for users with input validation, GET/POST/PUT/DELETE endpoints, error handling, and pytest tests. Start from scratch."
+```
+
+One command. Claude creates the project, writes all files, termiclaude approves everything.
 
 ## How it works
 
