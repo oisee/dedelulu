@@ -745,39 +745,40 @@ def launch_tmux(args_list: list[str], ipc_dir: str):
     # Foreman command
     foreman_cmd = f'{_shell_quote(python)} {_shell_quote(termiclaude_bin)} --foreman {_shell_quote(ipc_dir)}'
 
-    # Create tmux session: top pane = worker, then split bottom = foreman
+    # Create tmux session: left pane = worker, right 20% = foreman
     subprocess.run([
         tmux, 'new-session', '-d', '-s', session_name,
         '-x', '200', '-y', '50',
         worker_cmd,
     ])
     subprocess.run([
-        tmux, 'split-window', '-v', '-t', session_name,
-        '-l', '30%',
+        tmux, 'split-window', '-h', '-t', session_name,
+        '-l', '20%',
         foreman_cmd,
     ])
-    # Focus on top pane (worker/claude)
+    # Focus on left pane (worker/claude)
     subprocess.run([tmux, 'select-pane', '-t', f'{session_name}:.0'])
 
     # Attach
     os.execvp(tmux, [tmux, 'attach-session', '-t', session_name])
 
 
-def _launch_log_pane(log_path: str | None):
-    """When already inside tmux, split a narrow left pane showing the log."""
+def _launch_foreman_pane(ipc_dir: str):
+    """When already inside tmux, split a 20% right pane running the foreman."""
     import subprocess
     import shutil
     tmux = shutil.which('tmux')
-    if not tmux or not log_path:
+    if not tmux:
         return
-    # Split current pane horizontally, put log on the left (10% width)
-    # -b = before (left), -h = horizontal split, -l = size
-    log_cmd = f'touch {_shell_quote(log_path)} && tail -f {_shell_quote(log_path)}'
+    termiclaude_bin = os.path.abspath(__file__)
+    python = sys.executable
+    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(termiclaude_bin)} --foreman {_shell_quote(ipc_dir)}'
+    # Split current pane: right 20% = foreman
     subprocess.run([
-        tmux, 'split-window', '-h', '-b', '-l', '10%', log_cmd,
+        tmux, 'split-window', '-h', '-l', '20%', foreman_cmd,
     ])
-    # Focus back on the right pane (the main worker)
-    subprocess.run([tmux, 'select-pane', '-R'])
+    # Focus back on the left pane (the main worker)
+    subprocess.run([tmux, 'select-pane', '-L'])
 
 
 def _shell_quote(s: str) -> str:
@@ -1581,8 +1582,8 @@ usage:
   prompts, and logs every decision to termiclaude.jsonl.
 
   With tmux installed, termiclaude auto-splits into two panes:
-    top  = Claude Code (full passthrough, you see everything)
-    bottom = Foreman (status, logs, answers your questions)
+    left 80%  = Claude Code (full passthrough, you see everything)
+    right 20% = Foreman (status, logs, answers your questions)
 
 more examples:
   termiclaude claude "add tests for auth"     # auto-approve, goal auto-extracted
@@ -1687,8 +1688,10 @@ with system instructions (put termiclaude flags BEFORE the command):
         # Fall through to single-pane mode
         args.ipc_dir = None
     elif not args.no_tmux and not args.ipc_dir and os.environ.get('TMUX'):
-        # Already inside tmux — split a narrow log panel on the left
-        _launch_log_pane(log_path)
+        # Already inside tmux — split a 20% right pane with the foreman
+        ipc = IPC.create()
+        args.ipc_dir = ipc.ipc_dir
+        _launch_foreman_pane(ipc.ipc_dir)
 
     sup = Supervisor(
         command=command,
