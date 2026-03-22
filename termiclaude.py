@@ -161,14 +161,21 @@ def looks_like_prompt(text: str) -> bool:
 # =============================================================================
 
 def _normalize_llm_response(response: str) -> str:
-    """Normalize LLM response — handle ENTER, SKIP, quotes, escape sequences."""
+    """Normalize LLM response — handle escape sequences, special keys, quotes."""
     r = response.strip()
     # Strip wrapping quotes: 'y' → y, "no" → no
     if len(r) >= 2 and r[0] == r[-1] and r[0] in ('"', "'", '`'):
         r = r[1:-1]
+    # Backslash escape sequences (LLM writes \n, we send the real char)
+    _ESCAPES = {
+        '\\n': '', '\\r': '', '\\t': '\t', '\\e': '\x1b',
+        '\\x03': '\x03', '\\x1b': '\x1b',
+    }
+    if r in _ESCAPES:
+        return _ESCAPES[r]
     upper = r.upper()
     # ENTER variants
-    if upper in ('ENTER', '\\N', '\\R', '<ENTER>', '[ENTER]', 'RETURN',
+    if upper in ('ENTER', '<ENTER>', '[ENTER]', 'RETURN',
                  'PRESS ENTER', '(ENTER)', '(PRESS ENTER)', ''):
         return ''
     # SKIP variants
@@ -195,21 +202,22 @@ def ask_llm_prompt(context: str, provider: str = 'anthropic',
     if system_instructions:
         extra = f"\nADDITIONAL INSTRUCTIONS FROM USER:\n{system_instructions}\n"
 
-    prompt = f"""You are an autonomous supervisor for a CLI agent. The program below is waiting for user input. Decide what to type to let it continue productively.
-
-RULES:
-- Respond with ONLY the exact text to type (no quotes, no explanation)
-- For yes/no: respond "y" or "yes"
-- For numbered menus: respond with the number (e.g. "1")
-- For press enter: respond "ENTER"
-- For text input: respond with a reasonable short answer
-- If the program seems stuck/looping (not actually waiting for input), respond "SKIP"
-- If the program is asking for something dangerous (delete production data, etc), respond "SKIP"
-{extra}
-PROGRAM OUTPUT (last 30 lines):
-{context}
-
-YOUR INPUT:"""
+    prompt = ("You are an autonomous supervisor for a CLI agent. "
+              "The program below is waiting for user input. "
+              "Decide what to type to let it continue productively.\n\n"
+              "RULES:\n"
+              "- Respond with ONLY the exact text to type (no quotes, no explanation)\n"
+              "- For yes/no: respond y or yes\n"
+              "- For numbered menus: respond with the number (e.g. 1)\n"
+              "- For press enter: respond \\n\n"
+              "- For escape/cancel: respond \\e\n"
+              "- For tab: respond \\t\n"
+              "- For Ctrl+C: respond \\x03\n"
+              "- For text input: respond with a reasonable short answer\n"
+              "- If the program seems stuck/looping (not actually waiting for input), respond SKIP\n"
+              "- If the program is asking for something dangerous (delete production data, etc), respond SKIP\n"
+              + extra +
+              f"\nPROGRAM OUTPUT (last 30 lines):\n{context}\n\nYOUR INPUT:")
 
     try:
         if provider == 'claude-cli':
