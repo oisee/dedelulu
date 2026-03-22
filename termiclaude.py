@@ -763,6 +763,23 @@ def launch_tmux(args_list: list[str], ipc_dir: str):
     os.execvp(tmux, [tmux, 'attach-session', '-t', session_name])
 
 
+def _launch_log_pane(log_path: str | None):
+    """When already inside tmux, split a narrow left pane showing the log."""
+    import subprocess
+    import shutil
+    tmux = shutil.which('tmux')
+    if not tmux or not log_path:
+        return
+    # Split current pane horizontally, put log on the left (10% width)
+    # -b = before (left), -h = horizontal split, -l = size
+    log_cmd = f'touch {_shell_quote(log_path)} && tail -f {_shell_quote(log_path)}'
+    subprocess.run([
+        tmux, 'split-window', '-h', '-b', '-l', '10%', log_cmd,
+    ])
+    # Focus back on the right pane (the main worker)
+    subprocess.run([tmux, 'select-pane', '-R'])
+
+
 def _shell_quote(s: str) -> str:
     """Shell-quote a string."""
     if not s:
@@ -1578,11 +1595,17 @@ with supervisor (watches output, intervenes if agent goes off-rails):
   termiclaude --provider ollama claude "add JWT auth"
   termiclaude --provider ollama --supervise 30 claude "big refactor"
   termiclaude --provider anthropic --goal "fix login bug" claude
+
+with system instructions (put termiclaude flags BEFORE the command):
+  termiclaude --system "always say yes" -- claude "refactor auth"
+  termiclaude --system "use screenshots" --goal "fix TUI" -- claude "fix it"
         """
     )
 
     parser.add_argument('command', nargs=argparse.REMAINDER,
                         help='command to run and supervise (use -- before commands with flags)')
+    # NOTE: termiclaude flags (--system, --goal, etc) must come BEFORE the command.
+    # Use -- to separate: termiclaude --system "..." -- claude "prompt"
     parser.add_argument('--idle', type=float, default=4.0,
                         help='seconds of silence before checking for prompt (default: 4)')
     parser.add_argument('--provider',
@@ -1663,6 +1686,9 @@ with supervisor (watches output, intervenes if agent goes off-rails):
         # launch_tmux does execvp, so we only get here if tmux not found
         # Fall through to single-pane mode
         args.ipc_dir = None
+    elif not args.no_tmux and not args.ipc_dir and os.environ.get('TMUX'):
+        # Already inside tmux — split a narrow log panel on the left
+        _launch_log_pane(log_path)
 
     sup = Supervisor(
         command=command,
