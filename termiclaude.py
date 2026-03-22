@@ -161,8 +161,13 @@ def looks_like_prompt(text: str) -> bool:
 # =============================================================================
 
 def ask_llm_prompt(context: str, provider: str = 'anthropic',
-                   model: str = None, api_key: str = None) -> Optional[str]:
+                   model: str = None, api_key: str = None,
+                   system_instructions: str = None) -> Optional[str]:
     """Ask a cheap LLM what to type at a prompt. Returns the response string or None."""
+
+    extra = ''
+    if system_instructions:
+        extra = f"\nADDITIONAL INSTRUCTIONS FROM USER:\n{system_instructions}\n"
 
     prompt = f"""You are an autonomous supervisor for a CLI agent. The program below is waiting for user input. Decide what to type to let it continue productively.
 
@@ -174,7 +179,7 @@ RULES:
 - For text input: respond with a reasonable short answer
 - If the program seems stuck/looping (not actually waiting for input), respond "SKIP"
 - If the program is asking for something dangerous (delete production data, etc), respond "SKIP"
-
+{extra}
 PROGRAM OUTPUT (last 30 lines):
 {context}
 
@@ -805,7 +810,9 @@ class Supervisor:
                  api_key: str = None, dry_run: bool = False,
                  log_path: str = None, max_responses: int = 0,
                  goal: str = None, supervise_interval: float = 0,
-                 no_hooks: bool = False, ipc_dir: str = None):
+                 no_hooks: bool = False, ipc_dir: str = None,
+                 llm_only: bool = False,
+                 system_instructions: str = None):
         self.command = command
         self.idle_seconds = idle_seconds
         self.provider = provider
@@ -817,6 +824,8 @@ class Supervisor:
         self.supervise_interval = supervise_interval  # seconds between health checks (0=off)
         self.log_path = log_path
         self.ipc = IPC.connect(ipc_dir) if ipc_dir else None
+        self.llm_only = llm_only  # skip patterns, let LLM decide everything
+        self.system_instructions = system_instructions  # extra instructions for LLM
 
         self.master_fd = None
         self.child_pid = None
@@ -1173,8 +1182,8 @@ class Supervisor:
             self._notify("[termiclaude] Repeated prompt detected — pausing automation", 'alert')
             return
 
-        # Try fast pattern match first
-        response = fast_match(clean_tail_stripped)
+        # Try fast pattern match first (unless --llm-only)
+        response = None if self.llm_only else fast_match(clean_tail_stripped)
         source = 'pattern'
 
         if response is None:
@@ -1191,7 +1200,8 @@ class Supervisor:
                 context = '\n'.join(self.buffer[-30:])
                 clean_context = strip_ansi(context)
                 response = ask_llm_prompt(clean_context, provider=self.provider,
-                                   model=self.model, api_key=self.api_key)
+                                   model=self.model, api_key=self.api_key,
+                                   system_instructions=self.system_instructions)
                 source = 'llm'
 
                 if response and response.upper() == 'SKIP':
@@ -1568,6 +1578,11 @@ with supervisor (watches output, intervenes if agent goes off-rails):
                         help='disable Claude Code hooks (use PTY-only mode)')
     parser.add_argument('--no-tmux', action='store_true',
                         help='single-pane mode, no tmux split')
+    parser.add_argument('--llm-only', action='store_true',
+                        help='skip pattern matching, let LLM decide every response')
+    parser.add_argument('--system', metavar='TEXT',
+                        help='extra instructions for the supervisor LLM '
+                             '(e.g. "always answer no", "choose option 2")')
     parser.add_argument('--ipc-dir',
                         help=argparse.SUPPRESS)  # internal: set by tmux launcher
 
@@ -1617,6 +1632,8 @@ with supervisor (watches output, intervenes if agent goes off-rails):
         supervise_interval=supervise_interval,
         no_hooks=args.no_hooks,
         ipc_dir=args.ipc_dir,
+        llm_only=args.llm_only,
+        system_instructions=args.system,
     )
 
     exit_code = sup.start()
