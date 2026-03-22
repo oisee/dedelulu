@@ -249,14 +249,41 @@ class SupervisorVerdict:
 
 
 def ask_llm_supervise(goal: str, recent_output: str, provider: str = 'anthropic',
-                      model: str = None, api_key: str = None) -> Optional[SupervisorVerdict]:
+                      model: str = None, api_key: str = None,
+                      system_instructions: str = None,
+                      consecutive_stuck: int = 0) -> Optional[SupervisorVerdict]:
     """Supervisor LLM: assess whether the agent is on track toward the goal."""
+
+    system_extra = ''
+    if system_instructions:
+        system_extra = f"\nADDITIONAL INSTRUCTIONS FROM USER:\n{system_instructions}\n"
+
+    # First stuck detection → gentle message. Second+ → interrupt.
+    if consecutive_stuck == 0:
+        stuck_rule = (
+            '- "stuck" + "message": agent seems stuck or not making progress. '
+            'Send a helpful message to redirect it. Put the redirect in "message". '
+            'Do NOT interrupt on first detection — give the agent a chance to self-correct.'
+        )
+        error_rule = (
+            '- "error_loop" + "message": agent keeps hitting the same error. '
+            'Send a message suggesting a different approach. Do NOT interrupt yet.'
+        )
+    else:
+        stuck_rule = (
+            '- "stuck" + "interrupt": agent is STILL stuck after a previous redirect message. '
+            'Interrupt with Ctrl+C and provide a corrective message.'
+        )
+        error_rule = (
+            '- "error_loop" + "interrupt": agent keeps hitting the same error despite redirection. '
+            'Interrupt with Ctrl+C and suggest a different approach in "message".'
+        )
 
     prompt = f"""You are supervising an AI coding agent (Claude Code). The user gave it a task and you need to check if it's on track.
 
 ORIGINAL GOAL:
 {goal}
-
+{system_extra}
 RECENT AGENT OUTPUT (last ~80 lines, ANSI-stripped):
 {recent_output}
 
@@ -265,14 +292,15 @@ Assess the agent's status and respond in EXACTLY this JSON format (no other text
 
 RULES:
 - "on_track" + "continue": agent is making progress toward the goal. This is the most common case.
-- "stuck" + "interrupt": agent is repeating itself, hitting the same error, or not making progress. You will send Ctrl+C.
+{stuck_rule}
 - "off_rails" + "message": agent is working on something unrelated to the goal. message should redirect it.
-- "error_loop" + "interrupt": agent keeps hitting the same error without fixing it.
+{error_rule}
 - "idle" + "continue": agent finished or is waiting for a new prompt from the user. Do nothing.
 - "uncertain" + "escalate": you're not sure if this is right or wrong, or the agent is about to do something risky (destructive operations, major architectural changes, unclear requirements). Ask the human. Put your question in "message".
 - Be conservative — only interrupt if clearly stuck/wrong. False positives are worse than being patient.
 - Use "escalate" when the situation is ambiguous or risky — let the human decide.
 - If you see the agent actively writing code, running tests, reading files — that's "on_track".
+- IMPORTANT: when action is "message", always provide a helpful, specific redirect in "message" — don't leave it empty.
 
 JSON:"""
 
@@ -892,6 +920,7 @@ class Supervisor:
         self.rail_detector = RailDetector()
         self.running = True
         self.last_supervise_time = 0.0  # when we last ran a supervisor check
+        self.consecutive_stuck = 0     # how many times in a row supervisor said stuck/error_loop
 
         # Hooks state
         self._use_hooks = (not no_hooks
@@ -1007,6 +1036,8 @@ class Supervisor:
             env['TERMICLAUDE_API_KEY'] = self.api_key
         if self.ipc:
             env['TERMICLAUDE_IPC'] = self.ipc.ipc_dir
+        if self.system_instructions:
+            env['TERMICLAUDE_SYSTEM'] = self.system_instructions
         return env
 
     def start(self) -> int:
@@ -1314,7 +1345,9 @@ class Supervisor:
             recent_output=clean_output,
             provider=self.provider,
             model=self.model,
-            api_key=self.api_key
+            api_key=self.api_key,
+            system_instructions=self.system_instructions,
+            consecutive_stuck=self.consecutive_stuck,
         )
 
         if not verdict:
@@ -1325,7 +1358,14 @@ class Supervisor:
             'action': verdict.action,
             'message': verdict.message,
             'reasoning': verdict.reasoning,
+            'consecutive_stuck': self.consecutive_stuck,
         })
+
+        # Track consecutive stuck/error_loop detections
+        if verdict.status in ('stuck', 'error_loop', 'off_rails'):
+            self.consecutive_stuck += 1
+        else:
+            self.consecutive_stuck = 0
 
         if verdict.action == 'continue':
             # All good, just log
@@ -1503,12 +1543,14 @@ def _hook_stop():
         except Exception:
             stop_data = {}
 
+        system_instructions = os.environ.get('TERMICLAUDE_SYSTEM')
         verdict = ask_llm_supervise(
             goal=goal,
             recent_output=f"Recent tool actions:\n{context}",
             provider=provider,
             model=model,
             api_key=api_key,
+            system_instructions=system_instructions,
         )
 
         if verdict and log_path:
@@ -1676,7 +1718,7 @@ with system instructions (put termiclaude flags BEFORE the command):
     # If goal provided but no supervise interval, default to 60s
     supervise_interval = args.supervise
     if goal and supervise_interval == 0 and args.provider != 'none':
-        supervise_interval = 60.0
+        supervise_interval = 120.0
 
     # tmux auto-split: launch in tmux if not already there and not disabled
     if not args.no_tmux and not args.ipc_dir and not os.environ.get('TMUX'):
