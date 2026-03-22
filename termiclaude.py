@@ -1556,9 +1556,9 @@ with supervisor (watches output, intervenes if agent goes off-rails):
                         help='seconds of silence before checking for prompt (default: 4)')
     parser.add_argument('--provider',
                         choices=['none', 'claude-cli', 'anthropic', 'ollama', 'openai', 'azure'],
-                        default='none',
+                        default=None,
                         help='LLM provider for supervisor & ambiguous prompts '
-                             '(default: none, pattern-only)')
+                             '(default: azure if env vars set, else none)')
     parser.add_argument('--model', help='specific model to use with LLM provider')
     parser.add_argument('--api-key', help='API key (or use env var)')
     parser.add_argument('--dry-run', action='store_true',
@@ -1588,6 +1588,19 @@ with supervisor (watches output, intervenes if agent goes off-rails):
                         help=argparse.SUPPRESS)  # internal: set by tmux launcher
 
     args = parser.parse_args()
+
+    # Auto-detect provider: azure if env vars present, else none
+    if args.provider is None:
+        if os.getenv('AZURE_OPENAI_API_KEY') and os.getenv('AZURE_OPENAI_ENDPOINT'):
+            args.provider = 'azure'
+        else:
+            args.provider = 'none'
+            sys.stderr.write(
+                "\x1b[33m[termiclaude] AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT not set.\n"
+                "  Running without LLM supervisor (pattern-only).\n"
+                "  To enable: export AZURE_OPENAI_API_KEY=... AZURE_OPENAI_ENDPOINT=...\n"
+                "  Or use: --provider ollama / --provider anthropic\x1b[0m\n"
+            )
 
     log_path = None if args.no_log else args.log
 
