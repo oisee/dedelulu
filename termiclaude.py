@@ -25,6 +25,7 @@ import struct
 import fcntl
 import termios
 import argparse
+import tempfile
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -190,6 +191,9 @@ YOUR INPUT:"""
         elif provider == 'openai':
             return _ask_openai(prompt, model or 'gpt-4o-mini',
                                api_key or os.getenv('OPENAI_API_KEY'))
+        elif provider == 'azure':
+            return _ask_azure(prompt, model or 'gpt-4o',
+                              api_key or os.getenv('AZURE_OPENAI_API_KEY'))
         else:
             return None
     except Exception as e:
@@ -218,7 +222,7 @@ RECENT AGENT OUTPUT (last ~80 lines, ANSI-stripped):
 {recent_output}
 
 Assess the agent's status and respond in EXACTLY this JSON format (no other text):
-{{"status": "<on_track|stuck|off_rails|error_loop|idle>", "action": "<continue|interrupt|message>", "message": "<text to type if action is message, or empty>", "reasoning": "<1 sentence explanation>"}}
+{{"status": "<on_track|stuck|off_rails|error_loop|idle|uncertain>", "action": "<continue|interrupt|message|escalate>", "message": "<text to type if action is message, or question for human if escalate, or empty>", "reasoning": "<1 sentence explanation>"}}
 
 RULES:
 - "on_track" + "continue": agent is making progress toward the goal. This is the most common case.
@@ -226,7 +230,9 @@ RULES:
 - "off_rails" + "message": agent is working on something unrelated to the goal. message should redirect it.
 - "error_loop" + "interrupt": agent keeps hitting the same error without fixing it.
 - "idle" + "continue": agent finished or is waiting for a new prompt from the user. Do nothing.
+- "uncertain" + "escalate": you're not sure if this is right or wrong, or the agent is about to do something risky (destructive operations, major architectural changes, unclear requirements). Ask the human. Put your question in "message".
 - Be conservative — only interrupt if clearly stuck/wrong. False positives are worse than being patient.
+- Use "escalate" when the situation is ambiguous or risky — let the human decide.
 - If you see the agent actively writing code, running tests, reading files — that's "on_track".
 
 JSON:"""
@@ -242,6 +248,9 @@ JSON:"""
         elif provider == 'openai':
             raw = _ask_openai(prompt, model or 'gpt-4o-mini',
                               api_key or os.getenv('OPENAI_API_KEY'))
+        elif provider == 'azure':
+            raw = _ask_azure(prompt, model or 'gpt-4o-mini',
+                             api_key or os.getenv('AZURE_OPENAI_API_KEY'))
         else:
             return None
 
@@ -391,11 +400,54 @@ def _ask_openai(prompt: str, model: str, api_key: str) -> Optional[str]:
         return body['choices'][0]['message']['content'].strip()
 
 
+def _ask_azure(prompt: str, model: str, api_key: str) -> Optional[str]:
+    """Azure OpenAI API.
+
+    Env vars:
+        AZURE_OPENAI_API_KEY    — API key
+        AZURE_OPENAI_ENDPOINT   — e.g. https://myinstance.openai.azure.com
+        AZURE_OPENAI_API_VERSION — e.g. 2024-12-01-preview (default)
+        AZURE_OPENAI_DEPLOYMENT — deployment name (default: same as model)
+    """
+    if not api_key:
+        return None
+    import urllib.request
+    endpoint = os.getenv('AZURE_OPENAI_ENDPOINT', '').rstrip('/')
+    if not endpoint:
+        log_event('azure_error', {'error': 'AZURE_OPENAI_ENDPOINT not set'})
+        return None
+    api_version = os.getenv('AZURE_OPENAI_API_VERSION', '2024-12-01-preview')
+    deployment = os.getenv('AZURE_OPENAI_DEPLOYMENT', model)
+
+    url = f'{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}'
+    # Reasoning models (o-series) don't support temperature, use max_completion_tokens
+    is_reasoning = deployment.startswith('o')
+    payload = {
+        'messages': [{'role': 'user', 'content': prompt}],
+        'max_completion_tokens': 300,
+    }
+    if not is_reasoning:
+        payload['temperature'] = 0.0
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            'Content-Type': 'application/json',
+            'api-key': api_key
+        }
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = json.loads(resp.read())
+        return body['choices'][0]['message']['content'].strip()
+
+
 # =============================================================================
 # Logging
 # =============================================================================
 
 _log_file = None
+_log_ipc = None  # IPC instance for forwarding events to foreman
 
 
 def init_log(path: str):
@@ -403,16 +455,281 @@ def init_log(path: str):
     _log_file = open(path, 'a')
 
 
+def set_log_ipc(ipc):
+    global _log_ipc
+    _log_ipc = ipc
+
+
 def log_event(event: str, data: dict = None):
-    if not _log_file:
-        return
     entry = {
         'ts': datetime.now().isoformat(),
         'event': event,
         **(data or {})
     }
-    _log_file.write(json.dumps(entry) + '\n')
-    _log_file.flush()
+    if _log_file:
+        _log_file.write(json.dumps(entry) + '\n')
+        _log_file.flush()
+    if _log_ipc:
+        try:
+            _log_ipc.send_event(event, **(data or {}))
+        except Exception:
+            pass
+
+
+# =============================================================================
+# IPC — communication between worker (PTY) and foreman (status pane)
+# =============================================================================
+
+class IPC:
+    """File-based IPC between worker and foreman processes.
+
+    Directory layout:
+        {ipc_dir}/events.jsonl  — worker appends, foreman tails
+        {ipc_dir}/input.jsonl   — foreman appends, worker polls
+        {ipc_dir}/pid           — worker PID (for foreman to check liveness)
+    """
+
+    def __init__(self, ipc_dir: str):
+        self.ipc_dir = ipc_dir
+        self.events_path = os.path.join(ipc_dir, 'events.jsonl')
+        self.input_path = os.path.join(ipc_dir, 'input.jsonl')
+        self.pid_path = os.path.join(ipc_dir, 'pid')
+        self._input_pos = 0  # file position for polling input
+
+    @classmethod
+    def create(cls) -> 'IPC':
+        """Create a new IPC directory."""
+        ipc_dir = tempfile.mkdtemp(prefix='termiclaude_')
+        ipc = cls(ipc_dir)
+        # Touch files
+        open(ipc.events_path, 'w').close()
+        open(ipc.input_path, 'w').close()
+        with open(ipc.pid_path, 'w') as f:
+            f.write(str(os.getpid()))
+        return ipc
+
+    @classmethod
+    def connect(cls, ipc_dir: str) -> 'IPC':
+        """Connect to existing IPC directory."""
+        ipc = cls(ipc_dir)
+        # Start reading input from end (only new messages)
+        if os.path.exists(ipc.input_path):
+            ipc._input_pos = os.path.getsize(ipc.input_path)
+        return ipc
+
+    def send_event(self, event: str, **data):
+        """Worker → Foreman: append event."""
+        entry = {'ts': datetime.now().strftime('%H:%M:%S'), 'event': event, **data}
+        with open(self.events_path, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+
+    def poll_input(self) -> Optional[dict]:
+        """Worker polls for foreman responses. Returns newest message or None."""
+        try:
+            size = os.path.getsize(self.input_path)
+            if size <= self._input_pos:
+                return None
+            with open(self.input_path) as f:
+                f.seek(self._input_pos)
+                lines = f.readlines()
+                self._input_pos = f.tell()
+            # Return last message
+            for line in reversed(lines):
+                line = line.strip()
+                if line:
+                    return json.loads(line)
+        except Exception:
+            pass
+        return None
+
+    def send_input(self, message: str, **data):
+        """Foreman → Worker: send response."""
+        entry = {'ts': datetime.now().strftime('%H:%M:%S'), 'message': message, **data}
+        with open(self.input_path, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+
+    def worker_alive(self) -> bool:
+        """Check if worker process is still running."""
+        try:
+            with open(self.pid_path) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return True
+        except (FileNotFoundError, ValueError, ProcessLookupError):
+            return False
+
+    def cleanup(self):
+        """Remove IPC directory."""
+        import shutil
+        try:
+            shutil.rmtree(self.ipc_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+# =============================================================================
+# Foreman — interactive status pane
+# =============================================================================
+
+def run_foreman(ipc_dir: str):
+    """Foreman process: shows events, handles escalations."""
+    ipc = IPC.connect(ipc_dir)
+    events_pos = 0
+
+    # Colors
+    C_RESET = '\033[0m'
+    C_GRAY = '\033[90m'
+    C_CYAN = '\033[36m'
+    C_GREEN = '\033[32m'
+    C_YELLOW = '\033[1;33m'
+    C_RED = '\033[1;31m'
+    C_BOLD = '\033[1m'
+
+    print(f"{C_BOLD}─── termiclaude foreman ───{C_RESET}")
+    print(f"{C_GRAY}watching agent | ipc: {ipc_dir}{C_RESET}")
+    print()
+
+    pending_escalation = False
+
+    try:
+        while True:
+            # Check worker liveness
+            if not ipc.worker_alive():
+                print(f"\n{C_GRAY}Agent process exited.{C_RESET}")
+                break
+
+            # Read new events
+            try:
+                size = os.path.getsize(ipc.events_path)
+                if size > events_pos:
+                    with open(ipc.events_path) as f:
+                        f.seek(events_pos)
+                        new_lines = f.readlines()
+                        events_pos = f.tell()
+
+                    for line in new_lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        ts = ev.get('ts', '')
+                        event = ev.get('event', '')
+
+                        if event == 'hook_approve':
+                            tool = ev.get('tool', '?')
+                            print(f"  {C_GRAY}{ts}{C_RESET} {C_GREEN}✓{C_RESET} {tool}")
+
+                        elif event == 'respond':
+                            src = ev.get('source', '?')
+                            resp = ev.get('response', '')
+                            display = repr(resp) if resp else '↵'
+                            n = ev.get('count', '?')
+                            print(f"  {C_GRAY}{ts}{C_RESET} {C_CYAN}#{n}{C_RESET} sent {display} ({src})")
+
+                        elif event == 'supervise':
+                            status = ev.get('status', '?')
+                            reasoning = ev.get('reasoning', '')
+                            if status == 'on_track':
+                                print(f"  {C_GRAY}{ts}{C_RESET} {C_GREEN}● on track{C_RESET} {C_GRAY}{reasoning}{C_RESET}")
+                            else:
+                                print(f"  {C_GRAY}{ts}{C_RESET} {C_YELLOW}● {status}{C_RESET} {reasoning}")
+
+                        elif event == 'escalate':
+                            question = ev.get('question', ev.get('reasoning', '?'))
+                            print(f"\n  {C_YELLOW}{'─' * 50}")
+                            print(f"  ⚠  NEEDS YOUR INPUT")
+                            print(f"  {question}")
+                            print(f"  {'─' * 50}{C_RESET}\n")
+                            print('\a', end='', flush=True)  # BEL
+                            pending_escalation = True
+
+                        elif event == 'intervene':
+                            msg = ev.get('message', '')
+                            print(f"  {C_GRAY}{ts}{C_RESET} {C_RED}▶ intervened{C_RESET} {msg[:60]}")
+
+                        elif event in ('start', 'exit', 'hooks_installed', 'hooks_uninstalled'):
+                            print(f"  {C_GRAY}{ts} [{event}]{C_RESET}")
+
+                        else:
+                            print(f"  {C_GRAY}{ts} {event}{C_RESET}")
+
+            except Exception:
+                pass
+
+            # If escalation pending, prompt for input (non-blocking check)
+            if pending_escalation:
+                try:
+                    import select as sel
+                    r, _, _ = sel.select([sys.stdin], [], [], 0.1)
+                    if r:
+                        response = sys.stdin.readline().strip()
+                        if response:
+                            ipc.send_input(response)
+                            print(f"  {C_CYAN}→ sent: {response}{C_RESET}\n")
+                            pending_escalation = False
+                except Exception:
+                    pass
+            else:
+                time.sleep(0.3)
+
+    except KeyboardInterrupt:
+        print(f"\n{C_GRAY}Foreman stopped.{C_RESET}")
+
+
+# =============================================================================
+# tmux launcher — auto-split terminal
+# =============================================================================
+
+def launch_tmux(args_list: list[str], ipc_dir: str):
+    """Launch termiclaude in a tmux session with worker (top) + foreman (bottom)."""
+    import subprocess
+    import shutil
+
+    tmux = shutil.which('tmux')
+    if not tmux:
+        print("[termiclaude] tmux not found — run 'termiclaude --foreman' in another tab")
+        print(f"  IPC dir: {ipc_dir}")
+        return None
+
+    session_name = f'termiclaude-{os.getpid()}'
+    termiclaude_bin = os.path.abspath(__file__)
+    python = sys.executable
+
+    # Build worker command (pass through all original args + --ipc-dir)
+    worker_args = [python, termiclaude_bin, '--ipc-dir', ipc_dir] + args_list
+    worker_cmd = ' '.join(_shell_quote(a) for a in worker_args)
+
+    # Foreman command
+    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(termiclaude_bin)} --foreman {_shell_quote(ipc_dir)}'
+
+    # Create tmux session: top pane = worker, then split bottom = foreman
+    subprocess.run([
+        tmux, 'new-session', '-d', '-s', session_name,
+        '-x', '200', '-y', '50',
+        worker_cmd,
+    ])
+    subprocess.run([
+        tmux, 'split-window', '-v', '-t', session_name,
+        '-l', '30%',
+        foreman_cmd,
+    ])
+    # Focus on top pane (worker/claude)
+    subprocess.run([tmux, 'select-pane', '-t', f'{session_name}:.0'])
+
+    # Attach
+    os.execvp(tmux, [tmux, 'attach-session', '-t', session_name])
+
+
+def _shell_quote(s: str) -> str:
+    """Shell-quote a string."""
+    if not s:
+        return "''"
+    import shlex
+    return shlex.quote(s)
 
 
 # =============================================================================
@@ -487,7 +804,8 @@ class Supervisor:
                  provider: str = 'none', model: str = None,
                  api_key: str = None, dry_run: bool = False,
                  log_path: str = None, max_responses: int = 0,
-                 goal: str = None, supervise_interval: float = 0):
+                 goal: str = None, supervise_interval: float = 0,
+                 no_hooks: bool = False, ipc_dir: str = None):
         self.command = command
         self.idle_seconds = idle_seconds
         self.provider = provider
@@ -497,6 +815,8 @@ class Supervisor:
         self.max_responses = max_responses  # 0 = unlimited
         self.goal = goal                    # what the agent should be doing
         self.supervise_interval = supervise_interval  # seconds between health checks (0=off)
+        self.log_path = log_path
+        self.ipc = IPC.connect(ipc_dir) if ipc_dir else None
 
         self.master_fd = None
         self.child_pid = None
@@ -512,11 +832,128 @@ class Supervisor:
         self.running = True
         self.last_supervise_time = 0.0  # when we last ran a supervisor check
 
+        # Hooks state
+        self._use_hooks = (not no_hooks
+                           and command and command[0] in ('claude', 'claude-code'))
+        self._settings_backup = None
+        self._settings_path = None
+        self._state_file = None  # temp file for PostToolUse state
+
         if log_path:
             init_log(log_path)
+        if self.ipc:
+            set_log_ipc(self.ipc)
+
+    def _install_hooks(self):
+        """Install Claude Code hooks for auto-approval and supervisor."""
+        settings_dir = os.path.join(os.getcwd(), '.claude')
+        self._settings_path = os.path.join(settings_dir, 'settings.local.json')
+
+        # Backup existing settings
+        if os.path.exists(self._settings_path):
+            with open(self._settings_path) as f:
+                self._settings_backup = f.read()
+
+        settings = {}
+        if self._settings_backup:
+            try:
+                settings = json.loads(self._settings_backup)
+            except json.JSONDecodeError:
+                settings = {}
+
+        # Build hook command pointing to this script
+        hook_bin = os.path.abspath(__file__)
+        python = sys.executable
+
+        hooks = {
+            'PreToolUse': [{
+                'matcher': '',
+                'hooks': [{'type': 'command',
+                           'command': f'{python} {hook_bin} --hook-pre-tool'}]
+            }],
+        }
+
+        # PostToolUse: feed supervisor state
+        if self.goal and self.provider != 'none':
+            self._state_file = tempfile.NamedTemporaryFile(
+                mode='w', prefix='termiclaude_state_', suffix='.jsonl',
+                delete=False)
+            self._state_file.close()
+            hooks['PostToolUse'] = [{
+                'matcher': '',
+                'hooks': [{'type': 'command',
+                           'command': f'{python} {hook_bin} --hook-post-tool'}]
+            }]
+            # Stop hook: supervisor check when Claude is idle
+            hooks['Stop'] = [{
+                'matcher': '',
+                'hooks': [{'type': 'command',
+                           'command': f'{python} {hook_bin} --hook-stop'}]
+            }]
+
+        # Preserve existing hooks, add ours
+        existing_hooks = settings.get('hooks', {})
+        for event, hook_list in hooks.items():
+            existing = existing_hooks.get(event, [])
+            existing_hooks[event] = existing + hook_list
+        settings['hooks'] = existing_hooks
+
+        os.makedirs(settings_dir, exist_ok=True)
+        with open(self._settings_path, 'w') as f:
+            json.dump(settings, f, indent=2)
+
+        log_event('hooks_installed', {
+            'path': self._settings_path,
+            'events': list(hooks.keys()),
+        })
+
+    def _uninstall_hooks(self):
+        """Restore original settings after claude exits."""
+        if not self._settings_path:
+            return
+        try:
+            if self._settings_backup:
+                with open(self._settings_path, 'w') as f:
+                    f.write(self._settings_backup)
+            elif os.path.exists(self._settings_path):
+                os.remove(self._settings_path)
+        except Exception as e:
+            log_event('hooks_uninstall_error', {'error': str(e)})
+
+        # Clean up state file
+        if self._state_file:
+            try:
+                os.unlink(self._state_file.name)
+            except Exception:
+                pass
+
+        log_event('hooks_uninstalled')
+
+    def _get_hook_env(self) -> dict:
+        """Extra env vars for child process so hooks can find log/state/IPC."""
+        env = {}
+        if self.log_path:
+            env['TERMICLAUDE_LOG'] = os.path.abspath(self.log_path)
+        if self._state_file:
+            env['TERMICLAUDE_STATE'] = self._state_file.name
+        if self.goal:
+            env['TERMICLAUDE_GOAL'] = self.goal
+        if self.provider and self.provider != 'none':
+            env['TERMICLAUDE_PROVIDER'] = self.provider
+        if self.model:
+            env['TERMICLAUDE_MODEL'] = self.model
+        if self.api_key:
+            env['TERMICLAUDE_API_KEY'] = self.api_key
+        if self.ipc:
+            env['TERMICLAUDE_IPC'] = self.ipc.ipc_dir
+        return env
 
     def start(self) -> int:
         """Spawn child and run the supervisor loop. Returns exit code."""
+        # Install hooks before spawning claude
+        if self._use_hooks:
+            self._install_hooks()
+
         # Save original terminal settings
         old_attrs = None
         try:
@@ -531,6 +968,9 @@ class Supervisor:
             # Child: clean env so nested CLI agents (claude, etc.) don't refuse to start
             for var in ['CLAUDECODE', 'CLAUDE_CODE']:
                 os.environ.pop(var, None)
+            # Pass hook env vars
+            if self._use_hooks:
+                os.environ.update(self._get_hook_env())
             os.execvp(self.command[0], self.command)
             sys.exit(127)  # unreachable unless exec fails
 
@@ -581,6 +1021,9 @@ class Supervisor:
                 os.waitpid(self.child_pid, 0)
             except Exception:
                 pass
+            # Uninstall hooks
+            if self._use_hooks:
+                self._uninstall_hooks()
 
             log_event('exit', {'code': exit_code,
                                'total_responses': self.total_responses})
@@ -653,6 +1096,19 @@ class Supervisor:
                     self._supervise()
                     self.last_supervise_time = now
 
+            # Poll foreman input (escalation responses)
+            if self.ipc:
+                msg = self.ipc.poll_input()
+                if msg and msg.get('message'):
+                    response_text = msg['message']
+                    try:
+                        os.write(self.master_fd, (response_text + '\r').encode())
+                    except OSError:
+                        pass
+                    self.idle_handled = False  # resume auto-approvals
+                    self._notify(f"[termiclaude] foreman response: {response_text[:60]}", 'info')
+                    log_event('foreman_response', {'message': response_text})
+
             # Check if child exited
             try:
                 pid, status = os.waitpid(self.child_pid, os.WNOHANG)
@@ -709,12 +1165,12 @@ class Supervisor:
         # Check for rail issues
         if self.rail_detector.is_looping():
             log_event('rail_looping', {'context': clean_tail_stripped[-200:]})
-            self._print_supervisor("[termiclaude] Too many auto-responses/min — pausing automation")
+            self._notify("[termiclaude] Too many auto-responses/min — pausing automation", 'alert')
             return
 
         if self.rail_detector.is_repeating():
             log_event('rail_repeating', {'context': clean_tail_stripped[-200:]})
-            self._print_supervisor("[termiclaude] Repeated prompt detected — pausing automation")
+            self._notify("[termiclaude] Repeated prompt detected — pausing automation", 'alert')
             return
 
         # Try fast pattern match first
@@ -753,7 +1209,7 @@ class Supervisor:
         # Dry run?
         if self.dry_run:
             display = repr(response) if response else "'\\n'"
-            self._print_supervisor(f"[termiclaude] DRY RUN: would send {display} (source: {source})")
+            self._notify(f"[termiclaude] DRY RUN: would send {display} (source: {source})")
             log_event('dry_run', {'response': response, 'source': source,
                                   'context': clean_tail_stripped[-200:]})
             return
@@ -781,7 +1237,7 @@ class Supervisor:
         })
 
         # Brief visual indicator (sent to stderr so it doesn't mix with PTY)
-        self._print_supervisor(f"[termiclaude] #{self.total_responses} sent {display} ({source})")
+        self._notify(f"[termiclaude] #{self.total_responses} sent {display} ({source})", 'ok')
 
     def _supervise(self):
         """Periodic health check — ask supervisor LLM if agent is on track."""
@@ -813,12 +1269,29 @@ class Supervisor:
 
         if verdict.action == 'continue':
             # All good, just log
+            self._notify(f"[termiclaude] on track — {verdict.reasoning}", 'ok')
+            return
+
+        if verdict.action == 'escalate':
+            self.total_interventions += 1
+            question = verdict.message or verdict.reasoning
+            self._notify(
+                f"[termiclaude] NEEDS YOUR INPUT: {question}",
+                'escalate')
+            # Pause auto-approvals until user types something
+            self.idle_handled = True
+            log_event('escalate', {
+                'question': question,
+                'reasoning': verdict.reasoning,
+                'intervention_count': self.total_interventions,
+            })
             return
 
         if verdict.action == 'interrupt':
             self.total_interventions += 1
-            self._print_supervisor(
-                f"[termiclaude] SUPERVISOR: {verdict.status} — {verdict.reasoning}")
+            self._notify(
+                f"[termiclaude] INTERRUPTING: {verdict.status} — {verdict.reasoning}",
+                'alert')
             # Send Ctrl+C to interrupt the agent
             try:
                 os.write(self.master_fd, b'\x03')
@@ -831,8 +1304,8 @@ class Supervisor:
                     os.write(self.master_fd, (verdict.message + '\r').encode())
                 except OSError:
                     pass
-                self._print_supervisor(
-                    f"[termiclaude] SUPERVISOR: sent redirect: {verdict.message[:80]}")
+                self._notify(
+                    f"[termiclaude] sent redirect: {verdict.message[:80]}", 'info')
             log_event('intervene', {
                 'type': 'interrupt',
                 'message': verdict.message,
@@ -842,16 +1315,16 @@ class Supervisor:
 
         elif verdict.action == 'message':
             self.total_interventions += 1
-            self._print_supervisor(
-                f"[termiclaude] SUPERVISOR: redirecting — {verdict.reasoning}")
+            self._notify(
+                f"[termiclaude] REDIRECTING: {verdict.reasoning}", 'alert')
             # Type a message to the agent (it should be at a prompt)
             if verdict.message:
                 try:
                     os.write(self.master_fd, (verdict.message + '\r').encode())
                 except OSError:
                     pass
-                self._print_supervisor(
-                    f"[termiclaude] SUPERVISOR: sent: {verdict.message[:80]}")
+                self._notify(
+                    f"[termiclaude] sent: {verdict.message[:80]}", 'info')
             log_event('intervene', {
                 'type': 'message',
                 'message': verdict.message,
@@ -859,21 +1332,183 @@ class Supervisor:
                 'intervention_count': self.total_interventions,
             })
 
-    def _print_supervisor(self, msg: str):
-        """Print a supervisor message to stderr (won't interfere with PTY)."""
+    # ANSI color codes for notification levels
+    _NOTIFY_STYLES = {
+        'ok':       '\x1b[90m',        # gray — all good, low noise
+        'info':     '\x1b[36m',        # cyan — informational
+        'alert':    '\x1b[1;31m',      # bold red — intervention
+        'escalate': '\x1b[1;33m',      # bold yellow — needs human
+    }
+
+    def _notify(self, msg: str, level: str = 'info'):
+        """Print a supervisor message with appropriate urgency."""
         try:
-            # Save cursor, move to a safe spot, print, restore
-            sys.stderr.buffer.write(f"\r\n\x1b[90m{msg}\x1b[0m\r\n".encode())
+            style = self._NOTIFY_STYLES.get(level, '\x1b[90m')
+            bel = '\x07' if level in ('alert', 'escalate') else ''
+            line = f"\r\n{style}{msg}\x1b[0m{bel}\r\n"
+            sys.stderr.buffer.write(line.encode())
             sys.stderr.buffer.flush()
         except Exception:
             pass
+        # Forward to foreman via IPC
+        if self.ipc:
+            self.ipc.send_event('notify', msg=msg, level=level)
 
 
 # =============================================================================
 # CLI
 # =============================================================================
 
+def _hook_write_event(event: str, **data):
+    """Write event to log and IPC from hook subprocess."""
+    entry = {'ts': datetime.now().isoformat(), 'event': event, **data}
+    log_path = os.environ.get('TERMICLAUDE_LOG')
+    if log_path:
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    ipc_dir = os.environ.get('TERMICLAUDE_IPC')
+    if ipc_dir:
+        events_path = os.path.join(ipc_dir, 'events.jsonl')
+        ipc_entry = {'ts': datetime.now().strftime('%H:%M:%S'), 'event': event, **data}
+        with open(events_path, 'a') as f:
+            f.write(json.dumps(ipc_entry) + '\n')
+
+
+def _hook_pre_tool_use():
+    """Hook entry point for Claude Code PreToolUse — auto-approves all tools."""
+    try:
+        input_data = json.loads(sys.stdin.read())
+        tool_name = input_data.get('tool_name', 'unknown')
+        _hook_write_event('hook_approve', tool=tool_name)
+        json.dump({'decision': 'approve'}, sys.stdout)
+    except Exception:
+        json.dump({'decision': 'approve'}, sys.stdout)
+    sys.exit(0)
+
+
+def _hook_post_tool_use():
+    """Hook entry point for Claude Code PostToolUse — feeds supervisor."""
+    state_path = os.environ.get('TERMICLAUDE_STATE')
+    if not state_path:
+        sys.exit(0)
+
+    try:
+        input_data = json.loads(sys.stdin.read())
+        tool_name = input_data.get('tool_name', 'unknown')
+        tool_input = input_data.get('tool_input', {})
+        summary = _summarize_tool_input(tool_name, tool_input)
+
+        # Append to shared state file for supervisor to read
+        with open(state_path, 'a') as f:
+            f.write(json.dumps({
+                'ts': datetime.now().isoformat(),
+                'tool': tool_name,
+                'input_summary': summary,
+            }) + '\n')
+
+        _hook_write_event('hook_post_tool', tool=tool_name, summary=summary)
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+def _hook_stop():
+    """Hook entry point for Claude Code Stop — runs supervisor check."""
+    state_path = os.environ.get('TERMICLAUDE_STATE')
+    log_path = os.environ.get('TERMICLAUDE_LOG')
+    goal = os.environ.get('TERMICLAUDE_GOAL')
+    provider = os.environ.get('TERMICLAUDE_PROVIDER')
+    model = os.environ.get('TERMICLAUDE_MODEL')
+    api_key = os.environ.get('TERMICLAUDE_API_KEY')
+
+    if not (state_path and goal and provider):
+        sys.exit(0)
+
+    try:
+        # Read accumulated tool actions from state file
+        if not os.path.exists(state_path):
+            sys.exit(0)
+        with open(state_path) as f:
+            lines = f.readlines()
+        if not lines:
+            sys.exit(0)
+
+        # Build context from recent tool actions
+        recent = lines[-30:]  # last 30 tool actions
+        context = '\n'.join(line.strip() for line in recent)
+
+        # Also read stdin for stop event data
+        try:
+            stop_data = json.loads(sys.stdin.read())
+        except Exception:
+            stop_data = {}
+
+        verdict = ask_llm_supervise(
+            goal=goal,
+            recent_output=f"Recent tool actions:\n{context}",
+            provider=provider,
+            model=model,
+            api_key=api_key,
+        )
+
+        if verdict and log_path:
+            with open(log_path, 'a') as f:
+                f.write(json.dumps({
+                    'ts': datetime.now().isoformat(),
+                    'event': 'hook_supervise',
+                    'status': verdict.status,
+                    'action': verdict.action,
+                    'reasoning': verdict.reasoning,
+                }) + '\n')
+
+        # Clear state file after check
+        with open(state_path, 'w') as f:
+            pass
+
+        # Notify user based on verdict
+        if verdict and verdict.action == 'escalate':
+            msg = verdict.message or verdict.reasoning
+            sys.stderr.write(
+                f"\r\n\x1b[1;33m[termiclaude] NEEDS YOUR INPUT: {msg}\x1b[0m\x07\r\n")
+            sys.stderr.flush()
+        elif verdict and verdict.action in ('interrupt', 'message'):
+            sys.stderr.write(
+                f"\r\n\x1b[1;31m[termiclaude] SUPERVISOR: {verdict.reasoning}\x1b[0m\x07\r\n")
+            sys.stderr.flush()
+
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+def _summarize_tool_input(tool_name: str, tool_input: dict) -> str:
+    """Short summary of tool input for supervisor context."""
+    if tool_name in ('Read', 'Glob', 'Grep'):
+        return tool_input.get('file_path', tool_input.get('pattern', str(tool_input)[:100]))
+    if tool_name == 'Write':
+        path = tool_input.get('file_path', '?')
+        size = len(tool_input.get('content', ''))
+        return f'{path} ({size} chars)'
+    if tool_name == 'Edit':
+        return tool_input.get('file_path', '?')
+    if tool_name == 'Bash':
+        return tool_input.get('command', '')[:120]
+    return str(tool_input)[:100]
+
+
 def main():
+    # Handle hook subcommands before argparse (they read stdin, must be fast)
+    if len(sys.argv) >= 2 and sys.argv[1] == '--hook-pre-tool':
+        _hook_pre_tool_use()
+    if len(sys.argv) >= 2 and sys.argv[1] == '--hook-post-tool':
+        _hook_post_tool_use()
+    if len(sys.argv) >= 2 and sys.argv[1] == '--hook-stop':
+        _hook_stop()
+    # Foreman mode: termiclaude --foreman <ipc_dir>
+    if len(sys.argv) >= 3 and sys.argv[1] == '--foreman':
+        run_foreman(sys.argv[2])
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(
         prog='termiclaude',
         description='Autonomous supervisor for interactive CLI agents',
@@ -886,16 +1521,21 @@ usage:
   That's it. termiclaude wraps claude (or any CLI), auto-approves
   prompts, and logs every decision to termiclaude.jsonl.
 
+  With tmux installed, termiclaude auto-splits into two panes:
+    top  = Claude Code (full passthrough, you see everything)
+    bottom = Foreman (status, logs, answers your questions)
+
 more examples:
   termiclaude claude "add tests for auth"     # auto-approve, goal auto-extracted
   termiclaude --idle 8 claude "big refactor"  # more patience before responding
   termiclaude --dry-run claude "delete stuff" # see what it would approve
   termiclaude --no-log npm init               # wrap any interactive CLI
+  termiclaude --no-tmux claude "quick fix"    # single-pane mode (no split)
 
 with supervisor (watches output, intervenes if agent goes off-rails):
-  termiclaude --provider claude-cli claude "add JWT auth"       # uses Max sub!
-  termiclaude --provider claude-cli --supervise 30 claude "big refactor"
-  termiclaude --provider anthropic --goal "fix login bug" claude  # or use API
+  termiclaude --provider ollama claude "add JWT auth"
+  termiclaude --provider ollama --supervise 30 claude "big refactor"
+  termiclaude --provider anthropic --goal "fix login bug" claude
         """
     )
 
@@ -904,10 +1544,9 @@ with supervisor (watches output, intervenes if agent goes off-rails):
     parser.add_argument('--idle', type=float, default=4.0,
                         help='seconds of silence before checking for prompt (default: 4)')
     parser.add_argument('--provider',
-                        choices=['none', 'claude-cli', 'anthropic', 'ollama', 'openai'],
+                        choices=['none', 'claude-cli', 'anthropic', 'ollama', 'openai', 'azure'],
                         default='none',
-                        help='LLM provider for supervisor & ambiguous prompts. '
-                             'claude-cli uses your Max subscription via "claude -p" '
+                        help='LLM provider for supervisor & ambiguous prompts '
                              '(default: none, pattern-only)')
     parser.add_argument('--model', help='specific model to use with LLM provider')
     parser.add_argument('--api-key', help='API key (or use env var)')
@@ -925,6 +1564,12 @@ with supervisor (watches output, intervenes if agent goes off-rails):
     parser.add_argument('--supervise', type=float, default=0, metavar='SECS',
                         help='supervisor check interval in seconds '
                              '(default: 0=off, try 30-120)')
+    parser.add_argument('--no-hooks', action='store_true',
+                        help='disable Claude Code hooks (use PTY-only mode)')
+    parser.add_argument('--no-tmux', action='store_true',
+                        help='single-pane mode, no tmux split')
+    parser.add_argument('--ipc-dir',
+                        help=argparse.SUPPRESS)  # internal: set by tmux launcher
 
     args = parser.parse_args()
 
@@ -940,8 +1585,6 @@ with supervisor (watches output, intervenes if agent goes off-rails):
     # Auto-extract goal from command if wrapping claude and no explicit --goal
     goal = args.goal
     if not goal and len(command) >= 2 and command[0] in ('claude', 'claude-code'):
-        # claude "do the thing" → goal is "do the thing"
-        # claude -p "do the thing" → goal is "do the thing"
         non_flag_args = [a for a in command[1:] if not a.startswith('-')]
         if non_flag_args:
             goal = ' '.join(non_flag_args)
@@ -950,6 +1593,16 @@ with supervisor (watches output, intervenes if agent goes off-rails):
     supervise_interval = args.supervise
     if goal and supervise_interval == 0 and args.provider != 'none':
         supervise_interval = 60.0
+
+    # tmux auto-split: launch in tmux if not already there and not disabled
+    if not args.no_tmux and not args.ipc_dir and not os.environ.get('TMUX'):
+        ipc = IPC.create()
+        # Rebuild args for the worker (add --ipc-dir, pass everything else)
+        worker_args = sys.argv[1:]  # original args as-is
+        launch_tmux(worker_args, ipc.ipc_dir)
+        # launch_tmux does execvp, so we only get here if tmux not found
+        # Fall through to single-pane mode
+        args.ipc_dir = None
 
     sup = Supervisor(
         command=command,
@@ -962,9 +1615,18 @@ with supervisor (watches output, intervenes if agent goes off-rails):
         max_responses=args.max_responses,
         goal=goal,
         supervise_interval=supervise_interval,
+        no_hooks=args.no_hooks,
+        ipc_dir=args.ipc_dir,
     )
 
-    sys.exit(sup.start())
+    exit_code = sup.start()
+    # Clean up IPC if we created it
+    if args.ipc_dir:
+        try:
+            IPC(args.ipc_dir).cleanup()
+        except Exception:
+            pass
+    sys.exit(exit_code)
 
 
 if __name__ == '__main__':
