@@ -251,7 +251,8 @@ class SupervisorVerdict:
 def ask_llm_supervise(goal: str, recent_output: str, provider: str = 'anthropic',
                       model: str = None, api_key: str = None,
                       system_instructions: str = None,
-                      consecutive_stuck: int = 0) -> Optional[SupervisorVerdict]:
+                      consecutive_stuck: int = 0,
+                      intervention_history: list = None) -> Optional[SupervisorVerdict]:
     """Supervisor LLM: assess whether the agent is on track toward the goal."""
 
     system_extra = ''
@@ -279,12 +280,22 @@ def ask_llm_supervise(goal: str, recent_output: str, provider: str = 'anthropic'
             'Interrupt with Ctrl+C and suggest a different approach in "message".'
         )
 
+    history_ctx = ''
+    if intervention_history:
+        lines = []
+        for h in intervention_history[-7:]:  # last 7 entries
+            if h.get('msg'):
+                lines.append(f"  [{h['ts']}] you said: \"{h['msg']}\" (status: {h.get('status', '?')})")
+            else:
+                lines.append(f"  [{h['ts']}] checked: {h.get('status', '?')} — {h.get('reasoning', '')}")
+        history_ctx = "\nYOUR PREVIOUS CHECKS & MESSAGES (do NOT repeat — try a different angle each time):\n" + '\n'.join(lines) + "\n"
+
     prompt = f"""You are supervising an AI coding agent (Claude Code). The user gave it a task and you need to check if it's on track.
 
-ORIGINAL GOAL:
+GOAL:
 {goal}
-{system_extra}
-RECENT AGENT OUTPUT (last ~80 lines, ANSI-stripped):
+{system_extra}{history_ctx}
+AGENT CONTEXT (activity timeline + recent terminal output):
 {recent_output}
 
 Assess the agent's status and respond in EXACTLY this JSON format (no other text):
@@ -300,7 +311,11 @@ RULES:
 - Be conservative — only interrupt if clearly stuck/wrong. False positives are worse than being patient.
 - Use "escalate" when the situation is ambiguous or risky — let the human decide.
 - If you see the agent actively writing code, running tests, reading files — that's "on_track".
+- If the agent is idle/waiting at a prompt and the goal is open-ended or unclear — that's "idle" + "continue". Do NOT nag.
+- If you already sent a message and the agent acknowledged it — do NOT repeat yourself. That's "on_track" or "idle".
+- NEVER repeat the same message. Each intervention must be DIFFERENT — try a new angle, suggest a concrete next step, or ask a specific question. Vary your tone and approach like a real colleague would.
 - IMPORTANT: when action is "message", always provide a helpful, specific redirect in "message" — don't leave it empty.
+- Be warm and human, not robotic. Talk like a helpful colleague, not a system alert. No bureaucratic language. No referencing goal IDs, session IDs, or "original goal". Just be natural.
 
 JSON:"""
 
@@ -635,13 +650,106 @@ class IPC:
 
 
 # =============================================================================
-# Foreman — interactive status pane
+# Session — multi-worker state on disk (shared by foreman + workers)
 # =============================================================================
 
-def run_foreman(ipc_dir: str):
-    """Foreman process: shows events, handles escalations."""
-    ipc = IPC.connect(ipc_dir)
-    events_pos = 0
+@dataclass
+class WorkerSpec:
+    name: str
+    directory: str
+    task: str
+    ipc_dir: str = ''
+
+
+class Session:
+    """Persistent session state. Created automatically, even for single worker.
+
+    Layout:
+        {session_dir}/session.json    — worker specs, system instructions
+        {session_dir}/workers/{name}/ — per-worker IPC dirs
+    """
+
+    def __init__(self, session_dir: str):
+        self.session_dir = session_dir
+        self.session_file = os.path.join(session_dir, 'session.json')
+        self.workers_dir = os.path.join(session_dir, 'workers')
+        self.workers: dict[str, WorkerSpec] = {}
+        self.system_instructions: str = ''
+        self.extra_args: list[str] = []  # args to pass to new workers
+
+    @classmethod
+    def create(cls, name: str, directory: str, task: str,
+               system_instructions: str = '', extra_args: list[str] = None) -> 'Session':
+        session_dir = tempfile.mkdtemp(prefix='dedelulu_session_')
+        session = cls(session_dir)
+        os.makedirs(session.workers_dir, exist_ok=True)
+        session.system_instructions = system_instructions or ''
+        session.extra_args = extra_args or []
+        session.add_worker(name, directory, task)
+        return session
+
+    @classmethod
+    def load(cls, session_dir: str) -> 'Session':
+        session = cls(session_dir)
+        with open(session.session_file) as f:
+            data = json.load(f)
+        for wd in data.get('workers', []):
+            session.workers[wd['name']] = WorkerSpec(**wd)
+        session.system_instructions = data.get('system_instructions', '')
+        session.extra_args = data.get('extra_args', [])
+        return session
+
+    def save(self):
+        data = {
+            'workers': [
+                {'name': w.name, 'directory': w.directory,
+                 'task': w.task, 'ipc_dir': w.ipc_dir}
+                for w in self.workers.values()
+            ],
+            'system_instructions': self.system_instructions,
+            'extra_args': self.extra_args,
+        }
+        with open(self.session_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def add_worker(self, name: str, directory: str, task: str) -> WorkerSpec:
+        """Register a new worker — creates IPC dir, saves session."""
+        w_ipc_dir = os.path.join(self.workers_dir, name)
+        os.makedirs(w_ipc_dir, exist_ok=True)
+        for fname in ('events.jsonl', 'input.jsonl', 'pid'):
+            path = os.path.join(w_ipc_dir, fname)
+            if not os.path.exists(path):
+                open(path, 'w').close()
+        w = WorkerSpec(name=name, directory=directory, task=task, ipc_dir=w_ipc_dir)
+        self.workers[name] = w
+        self.save()
+        return w
+
+    def get_ipc(self, worker_name: str) -> IPC:
+        w = self.workers[worker_name]
+        return IPC.connect(w.ipc_dir)
+
+    def send_to_worker(self, worker_name: str, message: str, sender: str = 'foreman'):
+        ipc = self.get_ipc(worker_name)
+        ipc.send_input(message, sender=sender)
+
+    def broadcast(self, message: str, sender: str = 'foreman'):
+        for name in self.workers:
+            self.send_to_worker(name, message, sender=sender)
+
+
+# =============================================================================
+# Foreman — interactive status pane (manages all workers in session)
+# =============================================================================
+
+def run_foreman(session_dir: str):
+    """Foreman process: shows events from all workers, handles commands."""
+    session = Session.load(session_dir)
+
+    # Track file positions for each worker's events
+    events_pos: dict[str, int] = {}
+    for name in session.workers:
+        events_pos[name] = 0
 
     # Colors
     C_RESET = '\033[0m'
@@ -652,28 +760,88 @@ def run_foreman(ipc_dir: str):
     C_RED = '\033[1;31m'
     C_BOLD = '\033[1m'
 
-    print(f"{C_BOLD}─── dedelulu foreman ───{C_RESET}")
-    print(f"{C_GRAY}watching agent | ipc: {ipc_dir}{C_RESET}")
+    W_COLORS = ['\033[34m', '\033[35m', '\033[36m', '\033[33m',
+                '\033[32m', '\033[91m', '\033[94m', '\033[95m']
+    worker_color: dict[str, str] = {}
+    for i, name in enumerate(session.workers):
+        worker_color[name] = W_COLORS[i % len(W_COLORS)]
+
+    n = len(session.workers)
+    print(f"{C_BOLD}─── dedelulu foreman ─── {n} worker{'s' if n != 1 else ''} ───{C_RESET}")
+    for name, w in session.workers.items():
+        wc = worker_color[name]
+        print(f"  {wc}[{name}]{C_RESET} {w.directory} — {w.task[:60]}")
+    print()
+    print(f"{C_GRAY}Commands: /send <worker> msg  /add name:dir:task  /system new instructions")
+    print(f"          /broadcast msg  /status  /help{C_RESET}")
     print()
 
-    pending_escalation = False
+    pending_escalation = None  # (worker_name,) or None
+    import select as sel
+
+    def _print_event(worker_name, ev):
+        ts = ev.get('ts', '')
+        event = ev.get('event', '')
+        wc = worker_color.get(worker_name, '')
+        tag = f"{wc}[{worker_name}]{C_RESET}" if len(session.workers) > 1 else ''
+
+        if event == 'hook_approve':
+            tool = ev.get('tool', '?')
+            print(f"  {C_GRAY}{ts}{C_RESET} {tag} {C_GREEN}✓{C_RESET} {tool}")
+        elif event == 'respond':
+            src = ev.get('source', '?')
+            resp = ev.get('response', '')
+            display = repr(resp) if resp else '↵'
+            count = ev.get('count', '?')
+            print(f"  {C_GRAY}{ts}{C_RESET} {tag} {C_CYAN}#{count}{C_RESET} sent {display} ({src})")
+        elif event == 'supervise':
+            status = ev.get('status', '?')
+            reasoning = ev.get('reasoning', '')
+            if status == 'on_track':
+                print(f"  {C_GRAY}{ts}{C_RESET} {tag} {C_GREEN}●{C_RESET} {C_GRAY}{reasoning}{C_RESET}")
+            else:
+                print(f"  {C_GRAY}{ts}{C_RESET} {tag} {C_YELLOW}● {status}{C_RESET} {reasoning}")
+        elif event == 'escalate':
+            question = ev.get('question', ev.get('reasoning', '?'))
+            print(f"\n  {C_YELLOW}{'─' * 50}")
+            print(f"  ⚠  {tag} {C_YELLOW}NEEDS YOUR INPUT")
+            print(f"  {question}")
+            print(f"  {'─' * 50}{C_RESET}\n")
+            print('\a', end='', flush=True)
+        elif event == 'intervene':
+            msg = ev.get('message', '')
+            print(f"  {C_GRAY}{ts}{C_RESET} {tag} {C_RED}▶ intervened{C_RESET} {msg[:60]}")
+        elif event in ('start', 'exit', 'hooks_installed', 'hooks_uninstalled'):
+            print(f"  {C_GRAY}{ts}{C_RESET} {tag} {C_GRAY}[{event}]{C_RESET}")
+        else:
+            print(f"  {C_GRAY}{ts}{C_RESET} {tag} {C_GRAY}{event}{C_RESET}")
 
     try:
         while True:
-            # Check worker liveness
-            if not ipc.worker_alive():
-                print(f"\n{C_GRAY}Agent process exited.{C_RESET}")
+            # Check if any workers alive
+            any_alive = False
+            for name, w in session.workers.items():
+                ipc = IPC(w.ipc_dir)
+                if ipc.worker_alive():
+                    any_alive = True
+                    break
+            if not any_alive:
+                print(f"\n{C_GRAY}All workers exited.{C_RESET}")
                 break
 
-            # Read new events
-            try:
-                size = os.path.getsize(ipc.events_path)
-                if size > events_pos:
-                    with open(ipc.events_path) as f:
-                        f.seek(events_pos)
+            # Read new events from all workers
+            for name, w in session.workers.items():
+                events_path = os.path.join(w.ipc_dir, 'events.jsonl')
+                if name not in events_pos:
+                    events_pos[name] = 0
+                try:
+                    size = os.path.getsize(events_path)
+                    if size <= events_pos[name]:
+                        continue
+                    with open(events_path) as f:
+                        f.seek(events_pos[name])
                         new_lines = f.readlines()
-                        events_pos = f.tell()
-
+                        events_pos[name] = f.tell()
                     for line in new_lines:
                         line = line.strip()
                         if not line:
@@ -682,96 +850,209 @@ def run_foreman(ipc_dir: str):
                             ev = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-
-                        ts = ev.get('ts', '')
-                        event = ev.get('event', '')
-
-                        if event == 'hook_approve':
-                            tool = ev.get('tool', '?')
-                            print(f"  {C_GRAY}{ts}{C_RESET} {C_GREEN}✓{C_RESET} {tool}")
-
-                        elif event == 'respond':
-                            src = ev.get('source', '?')
-                            resp = ev.get('response', '')
-                            display = repr(resp) if resp else '↵'
-                            n = ev.get('count', '?')
-                            print(f"  {C_GRAY}{ts}{C_RESET} {C_CYAN}#{n}{C_RESET} sent {display} ({src})")
-
-                        elif event == 'supervise':
-                            status = ev.get('status', '?')
-                            reasoning = ev.get('reasoning', '')
-                            if status == 'on_track':
-                                print(f"  {C_GRAY}{ts}{C_RESET} {C_GREEN}● on track{C_RESET} {C_GRAY}{reasoning}{C_RESET}")
-                            else:
-                                print(f"  {C_GRAY}{ts}{C_RESET} {C_YELLOW}● {status}{C_RESET} {reasoning}")
-
-                        elif event == 'escalate':
-                            question = ev.get('question', ev.get('reasoning', '?'))
-                            print(f"\n  {C_YELLOW}{'─' * 50}")
-                            print(f"  ⚠  NEEDS YOUR INPUT")
-                            print(f"  {question}")
-                            print(f"  {'─' * 50}{C_RESET}\n")
-                            print('\a', end='', flush=True)  # BEL
-                            pending_escalation = True
-
-                        elif event == 'intervene':
-                            msg = ev.get('message', '')
-                            print(f"  {C_GRAY}{ts}{C_RESET} {C_RED}▶ intervened{C_RESET} {msg[:60]}")
-
-                        elif event in ('start', 'exit', 'hooks_installed', 'hooks_uninstalled'):
-                            print(f"  {C_GRAY}{ts} [{event}]{C_RESET}")
-
-                        else:
-                            print(f"  {C_GRAY}{ts} {event}{C_RESET}")
-
-            except Exception:
-                pass
-
-            # If escalation pending, prompt for input (non-blocking check)
-            if pending_escalation:
-                try:
-                    import select as sel
-                    r, _, _ = sel.select([sys.stdin], [], [], 0.1)
-                    if r:
-                        response = sys.stdin.readline().strip()
-                        if response:
-                            ipc.send_input(response)
-                            print(f"  {C_CYAN}→ sent: {response}{C_RESET}\n")
-                            pending_escalation = False
+                        if ev.get('event') == 'escalate':
+                            pending_escalation = name
+                        _print_event(name, ev)
                 except Exception:
                     pass
-            else:
+
+            # Check for user input
+            try:
+                r, _, _ = sel.select([sys.stdin], [], [], 0.3)
+                if r:
+                    raw = sys.stdin.readline().strip()
+                    if not raw:
+                        pass
+                    elif raw.startswith('/'):
+                        _foreman_command(raw, session, session_dir, events_pos,
+                                         worker_color, W_COLORS,
+                                         C_RESET, C_CYAN, C_GREEN, C_YELLOW, C_RED, C_GRAY, C_BOLD)
+                    elif pending_escalation:
+                        session.send_to_worker(pending_escalation, raw)
+                        wc = worker_color.get(pending_escalation, '')
+                        print(f"  {C_CYAN}→ {wc}[{pending_escalation}]{C_RESET} {raw}\n")
+                        pending_escalation = None
+                    elif len(session.workers) == 1:
+                        # Single worker — send directly
+                        name = next(iter(session.workers))
+                        session.send_to_worker(name, raw)
+                        print(f"  {C_CYAN}→ sent{C_RESET}")
+                    else:
+                        print(f"  {C_GRAY}use /send <worker> msg  or /help{C_RESET}")
+            except Exception:
                 time.sleep(0.3)
 
     except KeyboardInterrupt:
         print(f"\n{C_GRAY}Foreman stopped.{C_RESET}")
 
 
+def _foreman_command(raw: str, session: Session, session_dir: str,
+                     events_pos: dict, worker_color: dict, W_COLORS: list,
+                     C_RESET, C_CYAN, C_GREEN, C_YELLOW, C_RED, C_GRAY, C_BOLD):
+    """Handle foreman slash commands."""
+    parts = raw.split(None, 2)
+    cmd = parts[0].lower()
+
+    if cmd == '/help':
+        print(f"""
+  {C_BOLD}Foreman commands:{C_RESET}
+    /send <worker> message        — send message to worker
+    /broadcast message            — send to all workers
+    /add name:dir:task            — spawn a new worker
+    /system new instructions      — change system instructions live
+    /status                       — worker status overview
+    /log <worker>                 — last 15 events from worker
+    /help                         — this help
+
+  {C_GRAY}Without /, text goes to the single worker (or pending escalation).{C_RESET}
+""")
+
+    elif cmd == '/send' and len(parts) >= 3:
+        target = parts[1]
+        msg = parts[2]
+        if target in session.workers:
+            session.send_to_worker(target, msg)
+            wc = worker_color.get(target, '')
+            print(f"  → {wc}[{target}]{C_RESET} delivered")
+        else:
+            print(f"  {C_RED}unknown worker: {target}{C_RESET}")
+
+    elif cmd == '/broadcast' and len(parts) >= 2:
+        msg = ' '.join(parts[1:])
+        session.broadcast(msg)
+        print(f"  → all {len(session.workers)} workers delivered")
+
+    elif cmd == '/add' and len(parts) >= 2:
+        spec = parts[1] if len(parts) == 2 else parts[1] + ':' + parts[2]
+        spec_parts = spec.split(':', 2)
+        if len(spec_parts) != 3:
+            print(f"  {C_RED}usage: /add name:directory:task{C_RESET}")
+            return
+        name, directory, task = spec_parts
+        directory = os.path.expanduser(directory)
+        if name in session.workers:
+            print(f"  {C_RED}worker '{name}' already exists{C_RESET}")
+            return
+        if not os.path.isdir(directory):
+            print(f"  {C_RED}directory not found: {directory}{C_RESET}")
+            return
+
+        # Register worker in session
+        w = session.add_worker(name, directory, task)
+        events_pos[name] = 0
+        worker_color[name] = W_COLORS[len(worker_color) % len(W_COLORS)]
+
+        # Spawn tmux pane
+        _spawn_worker_pane(w, session, session_dir)
+
+        wc = worker_color[name]
+        print(f"  {C_GREEN}✓{C_RESET} spawned {wc}[{name}]{C_RESET} → {directory}")
+        print(f"    task: {task[:60]}")
+
+    elif cmd == '/system' and len(parts) >= 2:
+        new_system = ' '.join(parts[1:])
+        session.system_instructions = new_system
+        session.save()
+        # Notify all workers by writing to their state
+        print(f"  {C_GREEN}✓{C_RESET} system instructions updated")
+        print(f"  {C_GRAY}{new_system[:80]}{C_RESET}")
+
+    elif cmd == '/status':
+        # Reload session to pick up new workers
+        session_fresh = Session.load(session.session_dir)
+        print(f"  {C_BOLD}{'worker':<12} {'status':<10} {'task'}{C_RESET}")
+        print(f"  {'─'*12} {'─'*10} {'─'*30}")
+        for name, w in session_fresh.workers.items():
+            ipc = IPC(w.ipc_dir)
+            alive = ipc.worker_alive()
+            status = f"{C_GREEN}● alive{C_RESET}" if alive else f"{C_GRAY}○ exited{C_RESET}"
+            wc = worker_color.get(name, '')
+            print(f"  {wc}{name:<12}{C_RESET} {status:<20} {w.task[:40]}")
+        if session_fresh.system_instructions:
+            print(f"\n  {C_GRAY}system: {session_fresh.system_instructions[:60]}{C_RESET}")
+
+    elif cmd == '/log' and len(parts) >= 2:
+        worker_name = parts[1]
+        if worker_name not in session.workers:
+            print(f"  {C_RED}unknown worker: {worker_name}{C_RESET}")
+            return
+        w = session.workers[worker_name]
+        events_path = os.path.join(w.ipc_dir, 'events.jsonl')
+        try:
+            with open(events_path) as f:
+                lines = f.readlines()
+            for line in lines[-15:]:
+                line = line.strip()
+                if line:
+                    ev = json.loads(line)
+                    ts = ev.get('ts', '')
+                    event = ev.get('event', '')
+                    wc = worker_color.get(worker_name, '')
+                    print(f"  {C_GRAY}{ts}{C_RESET} {wc}[{worker_name}]{C_RESET} {event}")
+        except Exception as e:
+            print(f"  {C_RED}error: {e}{C_RESET}")
+
+    else:
+        print(f"  {C_GRAY}unknown command. /help for list{C_RESET}")
+
+
+def _spawn_worker_pane(w: WorkerSpec, session: Session, session_dir: str):
+    """Spawn a new tmux pane running dedelulu for this worker."""
+    import subprocess
+    import shutil
+    tmux = shutil.which('tmux')
+    if not tmux:
+        return
+    dedelulu_bin = os.path.abspath(__file__)
+    python = sys.executable
+
+    cmd_parts = [
+        python, dedelulu_bin,
+        '--ipc-dir', w.ipc_dir,
+        '--session-dir', session_dir,
+        '--no-tmux',
+    ] + session.extra_args + [
+        '--', 'claude', w.task,
+    ]
+    worker_cmd = f'cd {_shell_quote(w.directory)} && {" ".join(_shell_quote(a) for a in cmd_parts)}'
+
+    # Split from the foreman pane (current pane) — add worker to the left
+    subprocess.run([
+        tmux, 'split-window', '-h', '-b',
+        '-l', '70%',
+        'bash', '-c', worker_cmd,
+    ])
+    # Focus back to foreman (rightmost pane)
+    subprocess.run([tmux, 'select-pane', '-l'])
+
+
 # =============================================================================
 # tmux launcher — auto-split terminal
 # =============================================================================
 
-def launch_tmux(args_list: list[str], ipc_dir: str):
-    """Launch dedelulu in a tmux session with worker (top) + foreman (bottom)."""
+def launch_tmux(args_list: list[str], session_dir: str, ipc_dir: str):
+    """Launch dedelulu in a tmux session with worker (left) + foreman (right)."""
     import subprocess
     import shutil
 
     tmux = shutil.which('tmux')
     if not tmux:
         print("[dedelulu] tmux not found — run 'dedelulu --foreman' in another tab")
-        print(f"  IPC dir: {ipc_dir}")
+        print(f"  session: {session_dir}")
         return None
 
     session_name = f'dedelulu-{os.getpid()}'
     dedelulu_bin = os.path.abspath(__file__)
     python = sys.executable
 
-    # Build worker command (pass through all original args + --ipc-dir)
-    worker_args = [python, dedelulu_bin, '--ipc-dir', ipc_dir] + args_list
+    # Build worker command (pass through all original args + --ipc-dir + --session-dir)
+    worker_args = [python, dedelulu_bin,
+                   '--ipc-dir', ipc_dir,
+                   '--session-dir', session_dir] + args_list
     worker_cmd = ' '.join(_shell_quote(a) for a in worker_args)
 
     # Foreman command
-    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(dedelulu_bin)} --foreman {_shell_quote(ipc_dir)}'
+    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(dedelulu_bin)} --foreman {_shell_quote(session_dir)}'
 
     # Create tmux session: left pane = worker, right 20% = foreman
     subprocess.run([
@@ -791,7 +1072,7 @@ def launch_tmux(args_list: list[str], ipc_dir: str):
     os.execvp(tmux, [tmux, 'attach-session', '-t', session_name])
 
 
-def _launch_foreman_pane(ipc_dir: str):
+def _launch_foreman_pane(session_dir: str):
     """When already inside tmux, split a 20% right pane running the foreman."""
     import subprocess
     import shutil
@@ -800,7 +1081,7 @@ def _launch_foreman_pane(ipc_dir: str):
         return
     dedelulu_bin = os.path.abspath(__file__)
     python = sys.executable
-    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(dedelulu_bin)} --foreman {_shell_quote(ipc_dir)}'
+    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(dedelulu_bin)} --foreman {_shell_quote(session_dir)}'
     # Split current pane: right 20% = foreman
     subprocess.run([
         tmux, 'split-window', '-h', '-l', '20%', foreman_cmd,
@@ -901,7 +1182,9 @@ class Supervisor:
                  no_hooks: bool = False, ipc_dir: str = None,
                  llm_only: bool = False,
                  system_instructions: str = None,
-                 stale_timeout: float = 300.0):
+                 stale_timeout: float = 300.0,
+                 session_dir: str = None,
+                 worker_name: str = 'main'):
         self.command = command
         self.idle_seconds = idle_seconds
         self.provider = provider
@@ -916,13 +1199,17 @@ class Supervisor:
         self.llm_only = llm_only  # skip patterns, let LLM decide everything
         self.system_instructions = system_instructions  # extra instructions for LLM
         self.stale_timeout = stale_timeout  # seconds before nudging a stale agent
+        self.session_dir = session_dir      # session dir for multi-agent discovery
+        self.worker_name = worker_name      # this worker's name in the session
 
         self.master_fd = None
         self.child_pid = None
         self.buffer = []          # rolling buffer of recent output lines
         self.full_buffer = []     # full buffer for supervisor (not cleared on response)
-        self.max_buffer = 200     # keep last N lines
-        self.max_full_buffer = 500
+        self.max_buffer = 200     # keep last N lines (cleared on response)
+        self.max_full_buffer = 2000  # rolling terminal scrollback for supervisor
+        self.hook_timeline = []      # [{ts, tool, summary}, ...] from PostToolUse
+        self.max_hook_timeline = 200
         self.last_output_time = time.time()
         self.last_user_input_time = 0.0    # when user last typed something
         self.idle_handled = False  # already responded to this idle period?
@@ -933,6 +1220,9 @@ class Supervisor:
         self.running = True
         self.last_supervise_time = 0.0  # when we last ran a supervisor check
         self.consecutive_stuck = 0     # how many times in a row supervisor said stuck/error_loop
+        self.last_intervention_msg = '' # last message we sent to the agent (anti-repeat)
+        self.intervention_history = []  # rolling history: [{'msg': ..., 'verdict': ..., 'ts': ...}]
+        self.max_intervention_history = 10
 
         # Hooks state
         self._use_hooks = (not no_hooks
@@ -940,6 +1230,7 @@ class Supervisor:
         self._settings_backup = None
         self._settings_path = None
         self._state_file = None  # temp file for PostToolUse state
+        self._state_file_pos = 0  # file position for reading state file
 
         if log_path:
             init_log(log_path)
@@ -1050,6 +1341,10 @@ class Supervisor:
             env['TERMICLAUDE_IPC'] = self.ipc.ipc_dir
         if self.system_instructions:
             env['TERMICLAUDE_SYSTEM'] = self.system_instructions
+        if self.session_dir:
+            env['DEDELULU_SESSION'] = self.session_dir
+        if self.worker_name:
+            env['DEDELULU_WORKER'] = self.worker_name
         return env
 
     def start(self) -> int:
@@ -1069,6 +1364,11 @@ class Supervisor:
         self.child_pid, self.master_fd = pty.fork()
 
         if self.child_pid == 0:
+            # Pass session env vars (always, for dedelulu-send)
+            if self.session_dir:
+                os.environ['DEDELULU_SESSION'] = self.session_dir
+            if self.worker_name:
+                os.environ['DEDELULU_WORKER'] = self.worker_name
             # Pass hook env vars
             if self._use_hooks:
                 os.environ.update(self._get_hook_env())
@@ -1190,6 +1490,9 @@ class Supervisor:
                 elapsed = time.time() - self.last_output_time
                 if elapsed >= self.idle_seconds:
                     self._handle_idle()
+
+            # Ingest hook events into timeline
+            self._ingest_hook_timeline()
 
             # Periodic supervisor health check
             if (self.supervise_interval > 0 and self.goal
@@ -1356,6 +1659,60 @@ class Supervisor:
         source_info = f"{source}:{self.provider}" if source == 'llm' else source
         self._notify(f"[dedelulu] #{self.total_responses} sent {display} ({source_info})", 'ok')
 
+    def _ingest_hook_timeline(self):
+        """Read new PostToolUse entries from the state file into hook_timeline."""
+        if not self._state_file:
+            return
+        try:
+            path = self._state_file.name
+            size = os.path.getsize(path)
+            if size <= self._state_file_pos:
+                return
+            with open(path) as f:
+                f.seek(self._state_file_pos)
+                lines = f.readlines()
+                self._state_file_pos = f.tell()
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    self.hook_timeline.append({
+                        'ts': datetime.fromisoformat(entry['ts']).strftime('%H:%M:%S'),
+                        'tool': entry.get('tool', '?'),
+                        'summary': entry.get('input_summary', '')[:120],
+                    })
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            if len(self.hook_timeline) > self.max_hook_timeline:
+                self.hook_timeline = self.hook_timeline[-self.max_hook_timeline:]
+        except Exception:
+            pass
+
+    # ── Context builder for LLM calls ──
+
+    def _build_llm_context(self) -> str:
+        """Build rich context for supervisor LLM: hook timeline + terminal scrollback."""
+        parts = []
+
+        # 1. Hook timeline (compact activity log)
+        if self.hook_timeline:
+            tl_lines = []
+            for h in self.hook_timeline[-50:]:
+                tl_lines.append(f"  {h['ts']} {h['tool']}: {h['summary']}")
+            parts.append("AGENT ACTIVITY TIMELINE (tool calls):\n" + '\n'.join(tl_lines))
+
+        # 2. Terminal scrollback — ~3 pages worth
+        if self.full_buffer:
+            # ~200 lines ≈ 3 terminal pages (assuming 60-row terminal)
+            raw = '\n'.join(self.full_buffer[-200:])
+            clean = strip_ansi(raw).strip()
+            if clean:
+                parts.append(f"TERMINAL OUTPUT (last ~200 lines, ANSI-stripped):\n{clean}")
+
+        return '\n\n'.join(parts) if parts else '(no output yet)'
+
     # ── Level 2: Supervisor (health check only, never touches PTY) ──
 
     def _supervise(self):
@@ -1363,19 +1720,19 @@ class Supervisor:
         if not self.full_buffer:
             return
 
-        raw_output = '\n'.join(self.full_buffer[-80:])
-        clean_output = strip_ansi(raw_output).strip()
-        if not clean_output:
+        context = self._build_llm_context()
+        if not context.strip():
             return
 
         verdict = ask_llm_supervise(
             goal=self.goal,
-            recent_output=clean_output,
+            recent_output=context,
             provider=self.provider,
             model=self.model,
             api_key=self.api_key,
             system_instructions=self.system_instructions,
             consecutive_stuck=self.consecutive_stuck,
+            intervention_history=self.intervention_history,
         )
 
         if not verdict:
@@ -1397,7 +1754,24 @@ class Supervisor:
 
         if verdict.action == 'continue':
             self._notify(f"[dedelulu] on track — {verdict.reasoning}", 'ok')
+            # Record in history so next check sees the arc
+            self.intervention_history.append({
+                'ts': datetime.now().strftime('%H:%M:%S'),
+                'trigger': 'supervisor',
+                'status': verdict.status,
+                'msg': '',
+                'reasoning': verdict.reasoning,
+            })
+            if len(self.intervention_history) > self.max_intervention_history:
+                self.intervention_history = self.intervention_history[-self.max_intervention_history:]
             return
+
+        # Anti-loop: if we've been stuck 3+ times, stop nagging — escalate to human
+        if self.consecutive_stuck >= 3 and verdict.action != 'escalate':
+            self._notify(f"[dedelulu] stuck {self.consecutive_stuck}x — escalating to human", 'escalate')
+            verdict.action = 'escalate'
+            verdict.message = (f"Agent appears stuck ({self.consecutive_stuck} checks). "
+                              f"Last diagnosis: {verdict.reasoning}")
 
         # Everything else → escalate to interventor (level 3)
         self._intervene(
@@ -1491,6 +1865,16 @@ class Supervisor:
                 pass
 
         self.idle_handled = False  # allow auto-approvals after intervention
+        self.last_intervention_msg = message  # remember for anti-repeat
+        self.intervention_history.append({
+            'ts': datetime.now().strftime('%H:%M:%S'),
+            'trigger': trigger,
+            'status': status,
+            'msg': message,
+            'reasoning': reasoning,
+        })
+        if len(self.intervention_history) > self.max_intervention_history:
+            self.intervention_history = self.intervention_history[-self.max_intervention_history:]
 
         log_event('intervene', {
             'trigger': trigger,
@@ -1502,16 +1886,25 @@ class Supervisor:
 
     def _ask_stale_nudge(self, stats: dict) -> Optional[str]:
         """Ask LLM what to say to a stale agent. Returns message or None (skip)."""
-        raw_output = '\n'.join(self.full_buffer[-80:]) if self.full_buffer else ''
-        clean_output = strip_ansi(raw_output).strip() if raw_output else '(no recent output)'
+        context = self._build_llm_context()
         sys_instr = self.system_instructions or _DEFAULT_SUPERVISOR_SYSTEM
+
+        history_ctx = ''
+        if self.intervention_history:
+            lines = []
+            for h in self.intervention_history[-5:]:
+                if h.get('msg'):
+                    lines.append(f"  [{h['ts']}] you said: \"{h['msg']}\"")
+                else:
+                    lines.append(f"  [{h['ts']}] checked: {h.get('status', '?')}")
+            history_ctx = "\nYOUR PREVIOUS MESSAGES (do NOT repeat — try a different angle):\n" + '\n'.join(lines) + "\n"
 
         prompt = f"""You are supervising an AI coding agent (Claude Code). It has gone stale.
 
 GOAL: {self.goal or '(no specific goal set)'}
 
 INSTRUCTIONS: {sys_instr}
-
+{history_ctx}
 TIMING:
 - No output for {stats['since_output']}s ({stats['since_output'] // 60}min)
 - User last typed: {f"{stats['since_user_input']}s ago" if stats['since_user_input'] is not None else 'never this session'}
@@ -1519,10 +1912,11 @@ TIMING:
 - Total interventions so far: {stats['total_interventions']}
 - Consecutive stuck detections: {stats['consecutive_stuck']}
 
-LAST AGENT OUTPUT:
-{clean_output[-2000:]}
+AGENT CONTEXT:
+{context[-3000:]}
 
 Write a SHORT encouraging message (1-2 sentences) to send to the agent.
+Talk like a helpful colleague, not a system. Be natural.
 - If it finished: suggest verifying work or what to do next
 - If stuck: suggest a concrete next step
 - If clearly done and nothing needed: respond SKIP
@@ -1775,6 +2169,15 @@ stale agent nudging (auto-pokes agent if idle too long):
   dedelulu --stale 600 --provider ollama claude "task"   # nudge after 10min
   dedelulu --stale 0 --provider ollama claude "task"     # disable nudging
 
+multi-agent (add workers dynamically from foreman pane):
+  dedelulu claude "build the API"
+  # in foreman pane (Ctrl-B →):
+  #   /add tests:~/project:write pytest tests
+  #   /send tests "API is ready, start testing"
+  #   /broadcast "wrap up and commit"
+  #   /system "be more careful with destructive operations"
+  #   /status
+
 with system instructions (put dedelulu flags BEFORE the command):
   dedelulu --system "always say yes" -- claude "refactor auth"
   dedelulu --system "use screenshots" --goal "fix TUI" -- claude "fix it"
@@ -1820,8 +2223,12 @@ with system instructions (put dedelulu flags BEFORE the command):
     parser.add_argument('--stale', type=float, default=300.0, metavar='SECS',
                         help='seconds of inactivity before nudging stale agent '
                              '(default: 300 = 5min, 0=off)')
+    parser.add_argument('--name', default='main',
+                        help='worker name for multi-agent sessions (default: main)')
     parser.add_argument('--ipc-dir',
                         help=argparse.SUPPRESS)  # internal: set by tmux launcher
+    parser.add_argument('--session-dir',
+                        help=argparse.SUPPRESS)  # internal: session directory
 
     args = parser.parse_args()
 
@@ -1859,20 +2266,52 @@ with system instructions (put dedelulu flags BEFORE the command):
     if goal and supervise_interval == 0 and args.provider != 'none':
         supervise_interval = 120.0
 
+    # Build extra_args to pass when spawning new workers via /add
+    extra_args = []
+    if args.provider and args.provider != 'none':
+        extra_args += ['--provider', args.provider]
+    if args.model:
+        extra_args += ['--model', args.model]
+    if args.idle != 4.0:
+        extra_args += ['--idle', str(args.idle)]
+    if args.supervise > 0:
+        extra_args += ['--supervise', str(args.supervise)]
+    if args.stale != 300.0:
+        extra_args += ['--stale', str(args.stale)]
+    if args.no_hooks:
+        extra_args.append('--no-hooks')
+    if args.no_log:
+        extra_args.append('--no-log')
+    elif args.log != 'dedelulu.jsonl':
+        extra_args += ['--log', args.log]
+
     # tmux auto-split: launch in tmux if not already there and not disabled
     if not args.no_tmux and not args.ipc_dir and not os.environ.get('TMUX'):
-        ipc = IPC.create()
-        # Rebuild args for the worker (add --ipc-dir, pass everything else)
-        worker_args = sys.argv[1:]  # original args as-is
-        launch_tmux(worker_args, ipc.ipc_dir)
+        # Create session (first worker)
+        session = Session.create(
+            name=args.name, directory=os.getcwd(),
+            task=goal or ' '.join(command),
+            system_instructions=args.system or '',
+            extra_args=extra_args,
+        )
+        w = session.workers[args.name]
+        # Rebuild args for the worker
+        worker_args = sys.argv[1:]
+        launch_tmux(worker_args, session.session_dir, w.ipc_dir)
         # launch_tmux does execvp, so we only get here if tmux not found
-        # Fall through to single-pane mode
         args.ipc_dir = None
     elif not args.no_tmux and not args.ipc_dir and os.environ.get('TMUX'):
-        # Already inside tmux — split a 20% right pane with the foreman
-        ipc = IPC.create()
-        args.ipc_dir = ipc.ipc_dir
-        _launch_foreman_pane(ipc.ipc_dir)
+        # Already inside tmux — create session, split foreman pane
+        session = Session.create(
+            name=args.name, directory=os.getcwd(),
+            task=goal or ' '.join(command),
+            system_instructions=args.system or '',
+            extra_args=extra_args,
+        )
+        w = session.workers[args.name]
+        args.ipc_dir = w.ipc_dir
+        args.session_dir = session.session_dir
+        _launch_foreman_pane(session.session_dir)
 
     sup = Supervisor(
         command=command,
@@ -1890,6 +2329,8 @@ with system instructions (put dedelulu flags BEFORE the command):
         llm_only=args.llm_only,
         system_instructions=args.system,
         stale_timeout=args.stale,
+        session_dir=getattr(args, 'session_dir', None),
+        worker_name=args.name,
     )
 
     exit_code = sup.start()
@@ -1900,6 +2341,42 @@ with system instructions (put dedelulu flags BEFORE the command):
         except Exception:
             pass
     sys.exit(exit_code)
+
+
+def send_main():
+    """Entry point for dedelulu-send: send a message to another worker.
+
+    Usage: dedelulu-send <worker-name> <message>
+    Uses DEDELULU_SESSION env var to find the session.
+    """
+    if len(sys.argv) < 3:
+        print("usage: dedelulu-send <worker-name> <message>", file=sys.stderr)
+        sys.exit(1)
+
+    session_dir = os.environ.get('DEDELULU_SESSION')
+    if not session_dir:
+        print("error: DEDELULU_SESSION not set (are you running inside dedelulu?)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    target = sys.argv[1]
+    message = ' '.join(sys.argv[2:])
+
+    try:
+        session = Session.load(session_dir)
+    except Exception as e:
+        print(f"error: cannot load session: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if target not in session.workers:
+        available = ', '.join(session.workers.keys())
+        print(f"error: unknown worker '{target}' (available: {available})",
+              file=sys.stderr)
+        sys.exit(1)
+
+    sender = os.environ.get('DEDELULU_WORKER', 'unknown')
+    session.send_to_worker(target, message, sender=sender)
+    print(f"sent to [{target}]")
 
 
 if __name__ == '__main__':

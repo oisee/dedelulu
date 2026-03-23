@@ -26,13 +26,12 @@ setup(
         'anthropic': ['anthropic'],
         'openai': ['openai'],
     },
-    py_modules=['dedelulu', 'dedelulu_multi'],
+    py_modules=['dedelulu'],
     entry_points={
         'console_scripts': [
             'dedelulu=dedelulu:main',
             'ddll=dedelulu:main',
-            'dedelulu-multi=dedelulu_multi:main',
-            'ddllm=dedelulu_multi:main',
+            'dedelulu-send=dedelulu:send_main',
         ],
     },
 )
