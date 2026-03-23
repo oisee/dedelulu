@@ -898,7 +898,7 @@ def _foreman_command(raw: str, session: Session, session_dir: str,
   {C_BOLD}Foreman commands:{C_RESET}
     /send <worker> message        — send message to worker
     /broadcast message            — send to all workers
-    /add name:dir:task            — spawn a new worker
+    /add name:dir[:task]          — spawn a new worker (no task = interactive)
     /system new instructions      — change system instructions live
     /status                       — worker status overview
     /log <worker>                 — last 15 events from worker
@@ -925,10 +925,14 @@ def _foreman_command(raw: str, session: Session, session_dir: str,
     elif cmd == '/add' and len(parts) >= 2:
         spec = parts[1] if len(parts) == 2 else parts[1] + ':' + parts[2]
         spec_parts = spec.split(':', 2)
-        if len(spec_parts) != 3:
-            print(f"  {C_RED}usage: /add name:directory:task{C_RESET}")
+        if len(spec_parts) == 2:
+            name, directory = spec_parts
+            task = ''  # interactive — user types prompt themselves
+        elif len(spec_parts) == 3:
+            name, directory, task = spec_parts
+        else:
+            print(f"  {C_RED}usage: /add name:dir[:task]{C_RESET}")
             return
-        name, directory, task = spec_parts
         directory = os.path.expanduser(directory)
         if name in session.workers:
             print(f"  {C_RED}worker '{name}' already exists{C_RESET}")
@@ -946,8 +950,9 @@ def _foreman_command(raw: str, session: Session, session_dir: str,
         _spawn_worker_pane(w, session, session_dir)
 
         wc = worker_color[name]
+        mode = 'interactive' if not task else task[:60]
         print(f"  {C_GREEN}✓{C_RESET} spawned {wc}[{name}]{C_RESET} → {directory}")
-        print(f"    task: {task[:60]}")
+        print(f"    {C_GRAY}{mode}{C_RESET}")
 
     elif cmd == '/system' and len(parts) >= 2:
         new_system = ' '.join(parts[1:])
@@ -1011,9 +1016,9 @@ def _spawn_worker_pane(w: WorkerSpec, session: Session, session_dir: str):
         '--ipc-dir', w.ipc_dir,
         '--session-dir', session_dir,
         '--no-tmux',
-    ] + session.extra_args + [
-        '--', 'claude', w.task,
-    ]
+    ] + session.extra_args + ['--', 'claude']
+    if w.task:
+        cmd_parts.append(w.task)
     worker_cmd = f'cd {_shell_quote(w.directory)} && {" ".join(_shell_quote(a) for a in cmd_parts)}'
 
     # Split from the foreman pane (current pane) — add worker to the left
