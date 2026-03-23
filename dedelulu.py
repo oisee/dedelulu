@@ -1518,7 +1518,8 @@ class Supervisor:
                 time_since_nudge = now - self.last_stale_nudge_time if self.last_stale_nudge_time else float('inf')
                 if (time_since_output >= self.stale_timeout
                         and time_since_user >= self.stale_timeout
-                        and time_since_nudge >= self.stale_timeout):
+                        and time_since_nudge >= self.stale_timeout
+                        and not self._agent_waiting_for_user()):
                     self._intervene(trigger='stale', reasoning='agent stale, no activity')
                     self.last_stale_nudge_time = now
 
@@ -1666,6 +1667,24 @@ class Supervisor:
         # Brief visual indicator (sent to stderr so it doesn't mix with PTY)
         source_info = f"{source}:{self.provider}" if source == 'llm' else source
         self._notify(f"[dedelulu] #{self.total_responses} sent {display} ({source_info})", 'ok')
+
+    # Patterns that indicate the agent is done and waiting for user input (don't nudge)
+    _AGENT_WAITING_PATTERNS = [
+        re.compile(r'❯\s*$'),                          # Claude Code prompt
+        re.compile(r'^\s*>\s*$', re.MULTILINE),         # generic prompt
+        re.compile(r'Cogitated\s+for', re.IGNORECASE),  # Claude Code "Cogitated for Xm Ys"
+        re.compile(r'↓\s+to\s+manage'),                 # Claude Code "↓ to manage"
+        re.compile(r'tab\s+to\s+amend', re.IGNORECASE), # Claude Code waiting for next prompt
+    ]
+
+    def _agent_waiting_for_user(self) -> bool:
+        """Check if the agent's last output looks like it's waiting for the USER (not stuck)."""
+        if not self.buffer:
+            return False
+        # Check last 5 lines of raw output
+        tail = '\n'.join(self.buffer[-5:])
+        clean = strip_ansi(tail)
+        return any(p.search(clean) for p in self._AGENT_WAITING_PATTERNS)
 
     def _ingest_hook_timeline(self):
         """Read new PostToolUse entries from the state file into hook_timeline."""
