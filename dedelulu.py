@@ -1518,9 +1518,13 @@ class Supervisor:
                 time_since_nudge = now - self.last_stale_nudge_time if self.last_stale_nudge_time else float('inf')
                 if (time_since_output >= self.stale_timeout
                         and time_since_user >= self.stale_timeout
-                        and time_since_nudge >= self.stale_timeout
-                        and not self._agent_waiting_for_user()):
-                    self._intervene(trigger='stale', reasoning='agent stale, no activity')
+                        and time_since_nudge >= self.stale_timeout):
+                    if self._agent_waiting_for_user():
+                        # Agent is at prompt — let LLM decide if task is done or needs push
+                        self._intervene(trigger='stale_at_prompt',
+                                        reasoning='agent at prompt, checking if task complete')
+                    else:
+                        self._intervene(trigger='stale', reasoning='agent stale, no activity')
                     self.last_stale_nudge_time = now
 
             # Poll foreman input (escalation responses)
@@ -1854,8 +1858,8 @@ class Supervisor:
             return
 
         # ── Stale trigger with no message → ask LLM what to say ──
-        if trigger == 'stale' and not message:
-            message = self._ask_stale_nudge(stats)
+        if trigger.startswith('stale') and not message:
+            message = self._ask_stale_nudge(stats, at_prompt=(trigger == 'stale_at_prompt'))
             if message is None:
                 return  # LLM said SKIP or failed
 
@@ -1911,7 +1915,7 @@ class Supervisor:
             'stats': stats,
         })
 
-    def _ask_stale_nudge(self, stats: dict) -> Optional[str]:
+    def _ask_stale_nudge(self, stats: dict, at_prompt: bool = False) -> Optional[str]:
         """Ask LLM what to say to a stale agent. Returns message or None (skip)."""
         context = self._build_llm_context()
         sys_instr = self.system_instructions or _DEFAULT_SUPERVISOR_SYSTEM
@@ -1926,29 +1930,41 @@ class Supervisor:
                     lines.append(f"  [{h['ts']}] checked: {h.get('status', '?')}")
             history_ctx = "\nYOUR PREVIOUS MESSAGES (do NOT repeat — try a different angle):\n" + '\n'.join(lines) + "\n"
 
+        if at_prompt:
+            situation = (
+                "The agent is sitting at an input prompt (❯) and has not started new work.\n"
+                "First decide: is the GOAL fully achieved based on the activity timeline and output?\n"
+                "- If YES and nothing remains: respond SKIP\n"
+                "- If NO or unclear: write a message telling the agent what's still left to do. "
+                "Be specific — name the files, tests, or steps that still need work."
+            )
+        else:
+            situation = (
+                "The agent appears stuck mid-task with no output.\n"
+                "- If it finished: suggest verifying work or what to do next\n"
+                "- If stuck: suggest a concrete next step\n"
+                "- If clearly done and nothing needed: respond SKIP"
+            )
+
         prompt = f"""You are supervising an AI coding agent (Claude Code). It has gone stale.
 
 GOAL: {self.goal or '(no specific goal set)'}
 
 INSTRUCTIONS: {sys_instr}
 {history_ctx}
+SITUATION: {situation}
+
 TIMING:
 - No output for {stats['since_output']}s ({stats['since_output'] // 60}min)
 - User last typed: {f"{stats['since_user_input']}s ago" if stats['since_user_input'] is not None else 'never this session'}
 - Total auto-responses so far: {stats['total_responses']}
 - Total interventions so far: {stats['total_interventions']}
-- Consecutive stuck detections: {stats['consecutive_stuck']}
 
 AGENT CONTEXT:
 {context[-3000:]}
 
-Write a SHORT encouraging message (1-2 sentences) to send to the agent.
-Talk like a helpful colleague, not a system. Be natural.
-- If it finished: suggest verifying work or what to do next
-- If stuck: suggest a concrete next step
-- If clearly done and nothing needed: respond SKIP
-
-Reply with ONLY the message text (no quotes, no explanation)."""
+Talk like a helpful colleague, not a system. Be natural and concise (1-2 sentences).
+Reply with ONLY the message text (no quotes, no explanation). Or SKIP if done."""
 
         try:
             if self.provider == 'claude-cli':
