@@ -1360,6 +1360,14 @@ class Supervisor:
         except Exception:
             pass
 
+        # Write our PID so foreman can check liveness
+        if self.ipc:
+            try:
+                with open(self.ipc.pid_path, 'w') as f:
+                    f.write(str(os.getpid()))
+            except Exception:
+                pass
+
         # Fork PTY
         self.child_pid, self.master_fd = pty.fork()
 
