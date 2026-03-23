@@ -1,6 +1,6 @@
-# termiclaude
+# dedelulu
 
-Autonomous supervisor for interactive CLI agents. Wraps any command in a PTY,
+*dedelulu is the solulu* — autonomous supervisor for interactive CLI agents. Wraps any command in a PTY,
 auto-approves prompts via Claude Code hooks, and watches for agents going off-rails
 with a cheap LLM supervisor. Includes a **foreman TUI** (tmux split-pane)
 and **multi-worker orchestration** for parallel agents.
@@ -8,7 +8,7 @@ and **multi-worker orchestration** for parallel agents.
 ## Install
 
 ```bash
-cd ~/dev/termiclaude
+cd ~/dev/dedelulu
 pip install -e .
 ```
 
@@ -16,26 +16,26 @@ pip install -e .
 
 ```bash
 # Just auto-approve everything — no API keys needed
-termiclaude claude "add tests for the auth module"
+dedelulu claude "add tests for the auth module"
 
 # With supervisor — watches for derailing
-termiclaude --provider azure claude "add tests for the auth module"
+dedelulu --provider azure claude "add tests for the auth module"
 
 # Multi-worker — two agents collaborating
-termiclaude-multi \
+dedelulu-multi \
   --worker "api:.:implement CRUD endpoints" \
   --worker "tests:.:write pytest tests" \
   --provider azure
 ```
 
 That's it. Open a terminal, cd to your project, run the command.
-termiclaude auto-splits tmux (top: Claude, bottom: foreman),
+dedelulu auto-splits tmux (top: Claude, bottom: foreman),
 installs Claude Code hooks for instant approval, and logs every decision.
 
 ## How it works
 
 ```
-termiclaude claude "your task"
+dedelulu claude "your task"
   │
   ├── installs Claude Code hooks (.claude/settings.local.json)
   │     PreToolUse  → auto-approve (no prompt shown)
@@ -70,35 +70,35 @@ termiclaude claude "your task"
 ### Basic: auto-approve only (no API key needed)
 
 ```bash
-termiclaude claude "refactor auth to use JWT"
-termiclaude claude                              # interactive mode
-termiclaude npm init                            # works with any CLI
+dedelulu claude "refactor auth to use JWT"
+dedelulu claude                              # interactive mode
+dedelulu npm init                            # works with any CLI
 ```
 
 ### With supervisor (watches for derailing)
 
 ```bash
 # Azure OpenAI (gpt-4o, gpt-5.2, gpt-5.4)
-termiclaude --provider azure claude "add JWT auth"
-termiclaude --provider azure --model gpt-5.2 claude "big refactor"
+dedelulu --provider azure claude "add JWT auth"
+dedelulu --provider azure --model gpt-5.2 claude "big refactor"
 
 # Local Ollama (free, fast)
-termiclaude --provider ollama claude "add JWT auth"
+dedelulu --provider ollama claude "add JWT auth"
 
 # Anthropic API
-termiclaude --provider anthropic claude "fix login bug"
+dedelulu --provider anthropic claude "fix login bug"
 
 # OpenAI API
-termiclaude --provider openai claude "add tests"
+dedelulu --provider openai claude "add tests"
 
 # Another Claude Code instance (Max subscription, no API cost)
-termiclaude --provider claude-cli claude "refactor everything"
+dedelulu --provider claude-cli claude "refactor everything"
 ```
 
 ### Multi-worker: parallel agents
 
 ```bash
-termiclaude-multi \
+dedelulu-multi \
   --worker "api:~/project:implement REST endpoints" \
   --worker "tests:~/project:write comprehensive tests" \
   --provider azure
@@ -122,7 +122,7 @@ termiclaude-multi \
 --goal GOAL         What the agent should accomplish (auto-extracted from claude command)
 --supervise SECS    Supervisor check interval (default: 60s when provider is set)
 --dry-run           Detect prompts but don't send responses
---log FILE          Log file path (default: termiclaude.jsonl)
+--log FILE          Log file path (default: dedelulu.jsonl)
 --no-log            Disable logging
 --max-responses N   Stop auto-approving after N responses (0=unlimited)
 --no-hooks          Disable Claude Code hooks (PTY-only mode)
@@ -207,7 +207,7 @@ Foreman commands:
 
 ## Hooks
 
-When wrapping `claude`, termiclaude auto-installs Claude Code hooks
+When wrapping `claude`, dedelulu auto-installs Claude Code hooks
 (and removes them on exit):
 
 | Hook | Purpose |
@@ -230,7 +230,7 @@ When the supervisor is uncertain about what the agent is doing:
 
 ## Log format
 
-Every decision is logged to `termiclaude.jsonl` (one JSON object per line):
+Every decision is logged to `dedelulu.jsonl` (one JSON object per line):
 
 ```json
 {"ts": "...", "event": "hook_approve", "tool": "Write"}
@@ -245,14 +245,14 @@ Every decision is logged to `termiclaude.jsonl` (one JSON object per line):
 ### Single worker
 
 ```bash
-mkdir -p /tmp/termiclaude-demo && cd /tmp/termiclaude-demo
-termiclaude claude "Create a Flask CRUD API for users with pytest tests."
+mkdir -p /tmp/dedelulu-demo && cd /tmp/dedelulu-demo
+dedelulu claude "Create a Flask CRUD API for users with pytest tests."
 ```
 
 ### Multi-worker collaboration
 
 ```bash
-cd ~/dev/termiclaude
+cd ~/dev/dedelulu
 ./demo_multi.sh                        # with real Claude Code
 ./demo_multi.sh --provider azure       # with Azure supervisor
 ```
@@ -265,7 +265,7 @@ cd ~/dev/termiclaude
 - `--max-responses N` caps total auto-approvals
 - `--dry-run` shows what would happen without doing it
 - Rail detection: pauses if too many responses/minute or repeated prompts
-- You can always type into the terminal yourself — termiclaude backs off
+- You can always type into the terminal yourself — dedelulu backs off
 - Hooks are auto-removed on exit (original settings restored)
 
 ## E2E Guide

@@ -18,21 +18,21 @@ def _git_version():
 
 
 setup(
-    name='termiclaude',
+    name='dedelulu',
     version=_git_version(),
-    description='Autonomous supervisor for interactive CLI agents',
+    description='Autonomous supervisor for interactive CLI agents — dedelulu is the solulu',
     python_requires='>=3.10',
     extras_require={
         'anthropic': ['anthropic'],
         'openai': ['openai'],
     },
-    py_modules=['termiclaude', 'termiclaude_multi'],
+    py_modules=['dedelulu', 'dedelulu_multi'],
     entry_points={
         'console_scripts': [
-            'termiclaude=termiclaude:main',
-            'tc=termiclaude:main',
-            'termiclaude-multi=termiclaude_multi:main',
-            'tc-multi=termiclaude_multi:main',
+            'dedelulu=dedelulu:main',
+            'ddll=dedelulu:main',
+            'dedelulu-multi=dedelulu_multi:main',
+            'ddllm=dedelulu_multi:main',
         ],
     },
 )

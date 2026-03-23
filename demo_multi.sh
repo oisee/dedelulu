@@ -1,7 +1,7 @@
 #!/bin/bash
 # Demo: two Claude Code workers collaborating on a shared git repo
 #
-# Creates a toy project, clones it twice, and launches termiclaude-multi
+# Creates a toy project, clones it twice, and launches dedelulu-multi
 # with two workers: one builds the API, another writes tests.
 #
 # Usage:
@@ -10,10 +10,10 @@
 
 set -e
 
-DEMO_DIR="/tmp/termiclaude-multi-demo"
+DEMO_DIR="/tmp/dedelulu-multi-demo"
 EXTRA_ARGS="${@}"
 
-echo "=== termiclaude multi-worker demo ==="
+echo "=== dedelulu multi-worker demo ==="
 echo ""
 
 # Clean up previous demo
@@ -54,7 +54,7 @@ Simple Flask CRUD API for users. Two Claude Code agents will work on this:
 - **api-worker**: implements the CRUD endpoints in app.py
 - **test-worker**: writes pytest tests in test_app.py
 
-They coordinate through the termiclaude foreman.
+They coordinate through the dedelulu foreman.
 EOF
 
 git add -A
@@ -78,15 +78,15 @@ echo "  worker-api:   $DEMO_DIR/worker-api"
 echo "  worker-tests: $DEMO_DIR/worker-tests"
 echo ""
 
-# 3. Install termiclaude if needed
+# 3. Install dedelulu if needed
 cd "$(dirname "$0")"
-if ! command -v termiclaude-multi &>/dev/null; then
-    echo "[3.5/4] Installing termiclaude..."
+if ! command -v dedelulu-multi &>/dev/null; then
+    echo "[3.5/4] Installing dedelulu..."
     pip install -e . -q
 fi
 
 # 4. Launch multi-worker
-echo "[4/4] Launching termiclaude multi-worker..."
+echo "[4/4] Launching dedelulu multi-worker..."
 echo ""
 echo "  Two Claude Code agents will start:"
 echo "    [api]   → implements CRUD endpoints in app.py"
@@ -96,7 +96,7 @@ echo "  Foreman pane at bottom — use /send, /broadcast, /status"
 echo "  Press Ctrl-B then d to detach from tmux"
 echo ""
 
-exec termiclaude-multi \
+exec dedelulu-multi \
     --worker "api:$DEMO_DIR/worker-api:Implement a Flask CRUD API for users in app.py. Add a User model (in-memory dict), GET /users, GET /users/<id>, POST /users, PUT /users/<id>, DELETE /users/<id>. Add input validation and error handling. Do NOT write tests." \
     --worker "tests:$DEMO_DIR/worker-tests:Write comprehensive pytest tests in test_app.py for the Flask CRUD API. Import app from app.py. Test all endpoints: GET /users (empty and populated), POST /users (valid and invalid), PUT /users, DELETE /users. Use Flask test client. Wait for the api worker to finish the endpoints first — check app.py before writing tests." \
     $EXTRA_ARGS

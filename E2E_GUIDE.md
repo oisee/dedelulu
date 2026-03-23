@@ -1,10 +1,10 @@
-# End-to-End Guide: Autonomous Claude Code with termiclaude
+# End-to-End Guide: Autonomous Claude Code with dedelulu
 
 ## Setup (one time)
 
 ```bash
-# 1. Install termiclaude
-cd ~/dev/termiclaude
+# 1. Install dedelulu
+cd ~/dev/dedelulu
 pip install -e .
 
 # 2. Choose your supervisor provider:
@@ -25,7 +25,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # No setup needed — uses your Max subscription
 
 # 3. Verify it works
-termiclaude --idle 2 --no-log python3 -c "
+dedelulu --idle 2 --no-log python3 -c "
 r = input('Continue? [Y/n]: ')
 print(f'got: {r}')
 "
@@ -38,7 +38,7 @@ No supervisor needed. Just let Claude work and approve everything.
 
 ```bash
 cd ~/my-project
-termiclaude claude "add a health check endpoint at /api/health"
+dedelulu claude "add a health check endpoint at /api/health"
 ```
 
 What happens:
@@ -53,14 +53,14 @@ For longer tasks where Claude might get distracted.
 
 ```bash
 cd ~/my-project
-termiclaude --provider azure claude "add JWT authentication with middleware and tests"
+dedelulu --provider azure claude "add JWT authentication with middleware and tests"
 ```
 
 What happens:
 - Same as above, plus supervisor checks every 60s
 - If Claude goes off-rails: Ctrl+C + redirect message
 - If uncertain: foreman asks you (BEL + yellow banner)
-- Everything logged to `termiclaude.jsonl`
+- Everything logged to `dedelulu.jsonl`
 
 ## Use Case 3: Overnight autonomous session
 
@@ -78,7 +78,7 @@ Do NOT refactor existing code. Only add tests.
 EOF
 
 # Launch with supervisor, safety limits, and detailed logging
-termiclaude \
+dedelulu \
   --provider azure --model gpt-5.2 \
   --supervise 30 \
   --max-responses 100 \
@@ -115,7 +115,7 @@ Two agents working on the same project, coordinated by the foreman.
 ```bash
 cd ~/my-project
 
-termiclaude-multi \
+dedelulu-multi \
   --worker "api:.:implement REST CRUD endpoints in app.py" \
   --worker "tests:.:write pytest tests in test_app.py" \
   --provider azure
@@ -133,7 +133,7 @@ termiclaude-multi \
 ### Ready-to-run multi-worker demo
 
 ```bash
-cd ~/dev/termiclaude
+cd ~/dev/dedelulu
 ./demo_multi.sh                      # with real Claude Code
 ./demo_multi.sh --provider azure     # with Azure supervisor
 ```
@@ -149,29 +149,29 @@ See what would be auto-approved before committing to it.
 cd ~/my-project
 
 # Dry run — see what prompts Claude triggers
-termiclaude --dry-run --idle 6 \
+dedelulu --dry-run --idle 6 \
   claude "delete all unused dependencies and clean up imports"
 # Watch for [DRY RUN] messages, Ctrl+C when satisfied
 
 # If it looks safe:
-termiclaude --provider azure \
+dedelulu --provider azure \
   claude "delete all unused dependencies and clean up imports"
 ```
 
 ## Use Case 6: Non-Claude CLI tools
 
-termiclaude works with any interactive CLI, not just Claude Code.
+dedelulu works with any interactive CLI, not just Claude Code.
 
 ```bash
 # npm/yarn
-termiclaude npm init
-termiclaude npx create-next-app my-app
+dedelulu npm init
+dedelulu npx create-next-app my-app
 
 # git interactive
-termiclaude git rebase -i HEAD~5
+dedelulu git rebase -i HEAD~5
 
 # Any script with prompts
-termiclaude ./setup.sh
+dedelulu ./setup.sh
 ```
 
 For non-Claude tools, PTY pattern matching handles prompts (hooks are
@@ -218,15 +218,15 @@ The foreman pane shows real-time events and accepts commands:
 
 ## Troubleshooting
 
-### termiclaude doesn't respond to prompts
+### dedelulu doesn't respond to prompts
 - Increase `--idle` (maybe Claude is still outputting)
-- Check `termiclaude.jsonl` for what's being detected
+- Check `dedelulu.jsonl` for what's being detected
 - Try `--dry-run` to see pattern matches without sending
 
 ### Hooks not working
 - Check `.claude/settings.local.json` was created
 - Use `--no-hooks` to fall back to PTY-only mode
-- Hooks are auto-removed on exit; if termiclaude crashed, manually
+- Hooks are auto-removed on exit; if dedelulu crashed, manually
   restore `.claude/settings.local.json`
 
 ### Supervisor keeps intervening unnecessarily
@@ -235,7 +235,7 @@ The foreman pane shows real-time events and accepts commands:
 - Supervisor is conservative by design; false positives are rare
 
 ### Claude Code refuses to start (nested session error)
-- termiclaude clears CLAUDECODE env var automatically
+- dedelulu clears CLAUDECODE env var automatically
 - If still failing, run from a regular terminal, not inside Claude Code
 
 ### Azure connection issues

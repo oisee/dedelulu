@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-termiclaude multi — Multi-worker orchestration for termiclaude.
+dedelulu multi — Multi-worker orchestration for dedelulu.
 
 Spawns N Claude Code workers in tmux panes with a shared foreman.
 Workers can communicate through the foreman via /send and /broadcast.
 
 Usage:
-    termiclaude multi \
+    dedelulu multi \
       --worker "auth:~/project:implement JWT auth" \
       --worker "tests:~/project:write tests for auth" \
       --provider ollama
@@ -25,7 +25,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
-from termiclaude import IPC
+from dedelulu import IPC
 
 
 # =============================================================================
@@ -58,7 +58,7 @@ class Session:
 
     @classmethod
     def create(cls, workers: list[WorkerSpec]) -> 'Session':
-        session_dir = tempfile.mkdtemp(prefix='termiclaude_multi_')
+        session_dir = tempfile.mkdtemp(prefix='dedelulu_multi_')
         session = cls(session_dir)
         os.makedirs(session.workers_dir, exist_ok=True)
 
@@ -152,7 +152,7 @@ def run_multi_foreman(session_dir: str):
         worker_color[name] = W_COLORS[i % len(W_COLORS)]
 
     n = len(session.workers)
-    print(f"{C_BOLD}─── termiclaude foreman ─── {n} workers ───{C_RESET}")
+    print(f"{C_BOLD}─── dedelulu foreman ─── {n} workers ───{C_RESET}")
     for name, w in session.workers.items():
         wc = worker_color[name]
         print(f"  {wc}[{name}]{C_RESET} {w.directory} — {w.task[:60]}")
@@ -410,12 +410,12 @@ def launch_multi_tmux(session: Session, extra_args: list[str]):
     """Launch multi-worker tmux session."""
     tmux = shutil.which('tmux')
     if not tmux:
-        print("[termiclaude] tmux required for multi-worker mode")
+        print("[dedelulu] tmux required for multi-worker mode")
         sys.exit(1)
 
-    session_name = f'termiclaude-multi-{os.getpid()}'
-    termiclaude_bin = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), 'termiclaude.py'))
+    session_name = f'dedelulu-multi-{os.getpid()}'
+    dedelulu_bin = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), 'dedelulu.py'))
     python = sys.executable
 
     workers = list(session.workers.values())
@@ -424,7 +424,7 @@ def launch_multi_tmux(session: Session, extra_args: list[str]):
     worker_cmds = []
     for w in workers:
         cmd_parts = [
-            python, termiclaude_bin,
+            python, dedelulu_bin,
             '--ipc-dir', w.ipc_dir,
             '--no-tmux',
         ] + extra_args + [
@@ -487,16 +487,16 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog='termiclaude multi',
-        description='Multi-worker orchestration for termiclaude',
+        prog='dedelulu multi',
+        description='Multi-worker orchestration for dedelulu',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  termiclaude-multi \\
+  dedelulu-multi \\
     --worker "auth:~/project:implement JWT authentication" \\
     --worker "tests:~/project:write tests for auth module"
 
-  termiclaude-multi \\
+  dedelulu-multi \\
     --worker "backend:~/project/backend:REST API for users" \\
     --worker "frontend:~/project/frontend:React UI for users" \\
     --worker "tests:~/project:e2e tests" \\
@@ -514,8 +514,10 @@ examples:
     parser.add_argument('--model', help='specific model for supervisor')
     parser.add_argument('--idle', type=float, default=4.0)
     parser.add_argument('--supervise', type=float, default=0, metavar='SECS')
+    parser.add_argument('--stale', type=float, default=300.0, metavar='SECS',
+                        help='seconds of inactivity before nudging stale agent (default: 300)')
     parser.add_argument('--no-hooks', action='store_true')
-    parser.add_argument('--log', default='termiclaude.jsonl')
+    parser.add_argument('--log', default='dedelulu.jsonl')
     parser.add_argument('--no-log', action='store_true')
 
     args = parser.parse_args()
@@ -550,11 +552,13 @@ examples:
         extra_args += ['--idle', str(args.idle)]
     if args.supervise > 0:
         extra_args += ['--supervise', str(args.supervise)]
+    if args.stale != 300.0:
+        extra_args += ['--stale', str(args.stale)]
     if args.no_hooks:
         extra_args.append('--no-hooks')
     if args.no_log:
         extra_args.append('--no-log')
-    elif args.log != 'termiclaude.jsonl':
+    elif args.log != 'dedelulu.jsonl':
         extra_args += ['--log', args.log]
 
     # Launch tmux

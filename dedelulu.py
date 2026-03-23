@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-termiclaude - Autonomous supervisor for interactive CLI agents.
+dedelulu - Autonomous supervisor for interactive CLI agents.
 
 Wraps any command in a PTY, passes output straight through,
 detects when the program is waiting for input (via idle timeout),
@@ -8,9 +8,9 @@ and auto-responds with the right answer. No TUI wrapper, no
 rendering conflicts — just a transparent pipe with a brain.
 
 Usage:
-    termiclaude claude "do the thing"
-    termiclaude --idle 5 --provider anthropic npm install
-    termiclaude --dry-run claude "refactor everything"
+    dedelulu claude "do the thing"
+    dedelulu --idle 5 --provider anthropic npm install
+    dedelulu --dry-run claude "refactor everything"
 """
 
 import os
@@ -566,7 +566,7 @@ class IPC:
     @classmethod
     def create(cls) -> 'IPC':
         """Create a new IPC directory."""
-        ipc_dir = tempfile.mkdtemp(prefix='termiclaude_')
+        ipc_dir = tempfile.mkdtemp(prefix='dedelulu_')
         ipc = cls(ipc_dir)
         # Touch files
         open(ipc.events_path, 'w').close()
@@ -652,7 +652,7 @@ def run_foreman(ipc_dir: str):
     C_RED = '\033[1;31m'
     C_BOLD = '\033[1m'
 
-    print(f"{C_BOLD}─── termiclaude foreman ───{C_RESET}")
+    print(f"{C_BOLD}─── dedelulu foreman ───{C_RESET}")
     print(f"{C_GRAY}watching agent | ipc: {ipc_dir}{C_RESET}")
     print()
 
@@ -752,26 +752,26 @@ def run_foreman(ipc_dir: str):
 # =============================================================================
 
 def launch_tmux(args_list: list[str], ipc_dir: str):
-    """Launch termiclaude in a tmux session with worker (top) + foreman (bottom)."""
+    """Launch dedelulu in a tmux session with worker (top) + foreman (bottom)."""
     import subprocess
     import shutil
 
     tmux = shutil.which('tmux')
     if not tmux:
-        print("[termiclaude] tmux not found — run 'termiclaude --foreman' in another tab")
+        print("[dedelulu] tmux not found — run 'dedelulu --foreman' in another tab")
         print(f"  IPC dir: {ipc_dir}")
         return None
 
-    session_name = f'termiclaude-{os.getpid()}'
-    termiclaude_bin = os.path.abspath(__file__)
+    session_name = f'dedelulu-{os.getpid()}'
+    dedelulu_bin = os.path.abspath(__file__)
     python = sys.executable
 
     # Build worker command (pass through all original args + --ipc-dir)
-    worker_args = [python, termiclaude_bin, '--ipc-dir', ipc_dir] + args_list
+    worker_args = [python, dedelulu_bin, '--ipc-dir', ipc_dir] + args_list
     worker_cmd = ' '.join(_shell_quote(a) for a in worker_args)
 
     # Foreman command
-    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(termiclaude_bin)} --foreman {_shell_quote(ipc_dir)}'
+    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(dedelulu_bin)} --foreman {_shell_quote(ipc_dir)}'
 
     # Create tmux session: left pane = worker, right 20% = foreman
     subprocess.run([
@@ -798,9 +798,9 @@ def _launch_foreman_pane(ipc_dir: str):
     tmux = shutil.which('tmux')
     if not tmux:
         return
-    termiclaude_bin = os.path.abspath(__file__)
+    dedelulu_bin = os.path.abspath(__file__)
     python = sys.executable
-    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(termiclaude_bin)} --foreman {_shell_quote(ipc_dir)}'
+    foreman_cmd = f'{_shell_quote(python)} {_shell_quote(dedelulu_bin)} --foreman {_shell_quote(ipc_dir)}'
     # Split current pane: right 20% = foreman
     subprocess.run([
         tmux, 'split-window', '-h', '-l', '20%', foreman_cmd,
@@ -884,6 +884,14 @@ def set_winsize(fd: int, rows: int, cols: int):
 # Main supervisor loop
 # =============================================================================
 
+_DEFAULT_SUPERVISOR_SYSTEM = (
+    "Please support and encourage our agent gently. "
+    "Help if it is stuck, suggest creative and solid solutions if you know better, "
+    "and help to unstuck if it is stale. "
+    "Be concise and actionable — one or two sentences max."
+)
+
+
 class Supervisor:
     def __init__(self, command: list[str], idle_seconds: float = 4.0,
                  provider: str = 'none', model: str = None,
@@ -892,7 +900,8 @@ class Supervisor:
                  goal: str = None, supervise_interval: float = 0,
                  no_hooks: bool = False, ipc_dir: str = None,
                  llm_only: bool = False,
-                 system_instructions: str = None):
+                 system_instructions: str = None,
+                 stale_timeout: float = 300.0):
         self.command = command
         self.idle_seconds = idle_seconds
         self.provider = provider
@@ -906,6 +915,7 @@ class Supervisor:
         self.ipc = IPC.connect(ipc_dir) if ipc_dir else None
         self.llm_only = llm_only  # skip patterns, let LLM decide everything
         self.system_instructions = system_instructions  # extra instructions for LLM
+        self.stale_timeout = stale_timeout  # seconds before nudging a stale agent
 
         self.master_fd = None
         self.child_pid = None
@@ -914,7 +924,9 @@ class Supervisor:
         self.max_buffer = 200     # keep last N lines
         self.max_full_buffer = 500
         self.last_output_time = time.time()
+        self.last_user_input_time = 0.0    # when user last typed something
         self.idle_handled = False  # already responded to this idle period?
+        self.last_stale_nudge_time = 0.0   # when we last sent a stale nudge
         self.total_responses = 0
         self.total_interventions = 0
         self.rail_detector = RailDetector()
@@ -966,7 +978,7 @@ class Supervisor:
         # PostToolUse: feed supervisor state
         if self.goal and self.provider != 'none':
             self._state_file = tempfile.NamedTemporaryFile(
-                mode='w', prefix='termiclaude_state_', suffix='.jsonl',
+                mode='w', prefix='dedelulu_state_', suffix='.jsonl',
                 delete=False)
             self._state_file.close()
             hooks['PostToolUse'] = [{
@@ -1153,6 +1165,7 @@ class Supervisor:
                     text = data.decode('utf-8', errors='replace')
                     self._buffer_output(text)
                     self.last_output_time = time.time()
+                    self.last_stale_nudge_time = 0.0  # reset stale timer on new output
                     self.idle_handled = False
 
                 elif fd == sys.stdin.fileno():
@@ -1169,6 +1182,7 @@ class Supervisor:
                             break
                         # User typed something — reset idle
                         self.last_output_time = time.time()
+                        self.last_user_input_time = time.time()
                         self.idle_handled = True  # don't auto-respond after user input
 
             # Check for idle (prompt auto-response)
@@ -1185,6 +1199,18 @@ class Supervisor:
                     self._supervise()
                     self.last_supervise_time = now
 
+            # Stale agent detection — nudge if idle too long and user not typing
+            if self.stale_timeout > 0 and self.provider != 'none':
+                now = time.time()
+                time_since_output = now - self.last_output_time
+                time_since_user = now - self.last_user_input_time if self.last_user_input_time else float('inf')
+                time_since_nudge = now - self.last_stale_nudge_time if self.last_stale_nudge_time else float('inf')
+                if (time_since_output >= self.stale_timeout
+                        and time_since_user >= self.stale_timeout
+                        and time_since_nudge >= self.stale_timeout):
+                    self._intervene(trigger='stale', reasoning='agent stale, no activity')
+                    self.last_stale_nudge_time = now
+
             # Poll foreman input (escalation responses)
             if self.ipc:
                 msg = self.ipc.poll_input()
@@ -1195,7 +1221,7 @@ class Supervisor:
                     except OSError:
                         pass
                     self.idle_handled = False  # resume auto-approvals
-                    self._notify(f"[termiclaude] foreman response: {response_text[:60]}", 'info')
+                    self._notify(f"[dedelulu] foreman response: {response_text[:60]}", 'info')
                     log_event('foreman_response', {'message': response_text})
 
             # Check if child exited
@@ -1254,12 +1280,12 @@ class Supervisor:
         # Check for rail issues
         if self.rail_detector.is_looping():
             log_event('rail_looping', {'context': clean_tail_stripped[-200:]})
-            self._notify("[termiclaude] Too many auto-responses/min — pausing automation", 'alert')
+            self._notify("[dedelulu] Too many auto-responses/min — pausing automation", 'alert')
             return
 
         if self.rail_detector.is_repeating():
             log_event('rail_repeating', {'context': clean_tail_stripped[-200:]})
-            self._notify("[termiclaude] Repeated prompt detected — pausing automation", 'alert')
+            self._notify("[dedelulu] Repeated prompt detected — pausing automation", 'alert')
             return
 
         # Try fast pattern match first (unless --llm-only)
@@ -1299,7 +1325,7 @@ class Supervisor:
         # Dry run?
         if self.dry_run:
             display = repr(response) if response else "'\\n'"
-            self._notify(f"[termiclaude] DRY RUN: would send {display} (source: {source})")
+            self._notify(f"[dedelulu] DRY RUN: would send {display} (source: {source})")
             log_event('dry_run', {'response': response, 'source': source,
                                   'context': clean_tail_stripped[-200:]})
             return
@@ -1328,10 +1354,12 @@ class Supervisor:
 
         # Brief visual indicator (sent to stderr so it doesn't mix with PTY)
         source_info = f"{source}:{self.provider}" if source == 'llm' else source
-        self._notify(f"[termiclaude] #{self.total_responses} sent {display} ({source_info})", 'ok')
+        self._notify(f"[dedelulu] #{self.total_responses} sent {display} ({source_info})", 'ok')
+
+    # ── Level 2: Supervisor (health check only, never touches PTY) ──
 
     def _supervise(self):
-        """Periodic health check — ask supervisor LLM if agent is on track."""
+        """Periodic health check — diagnose only, escalate to interventor if needed."""
         if not self.full_buffer:
             return
 
@@ -1368,69 +1396,172 @@ class Supervisor:
             self.consecutive_stuck = 0
 
         if verdict.action == 'continue':
-            # All good, just log
-            self._notify(f"[termiclaude] on track — {verdict.reasoning}", 'ok')
+            self._notify(f"[dedelulu] on track — {verdict.reasoning}", 'ok')
             return
 
-        if verdict.action == 'escalate':
+        # Everything else → escalate to interventor (level 3)
+        self._intervene(
+            trigger='supervisor',
+            action=verdict.action,
+            message=verdict.message,
+            reasoning=verdict.reasoning,
+            status=verdict.status,
+        )
+
+    # ── Level 3: Interventor (single place that talks to the agent) ──
+
+    def _get_timing_stats(self) -> dict:
+        """Collect timing stats for the interventor."""
+        now = time.time()
+        return {
+            'since_output': int(now - self.last_output_time),
+            'since_user_input': int(now - self.last_user_input_time) if self.last_user_input_time else None,
+            'since_last_nudge': int(now - self.last_stale_nudge_time) if self.last_stale_nudge_time else None,
+            'since_supervise': int(now - self.last_supervise_time) if self.last_supervise_time else None,
+            'total_responses': self.total_responses,
+            'total_interventions': self.total_interventions,
+            'consecutive_stuck': self.consecutive_stuck,
+        }
+
+    def _intervene(self, trigger: str, action: str = 'message',
+                   message: str = '', reasoning: str = '', status: str = ''):
+        """Level 3: actually send messages / interrupts to the agent.
+
+        Args:
+            trigger: what caused this — 'supervisor', 'stale', or 'stale_supervisor'
+            action: 'message', 'interrupt', 'escalate'
+            message: text to send (if empty and trigger is 'stale', ask LLM)
+            reasoning: why we're intervening
+            status: supervisor diagnosis (stuck, off_rails, etc.)
+        """
+        stats = self._get_timing_stats()
+
+        # ── Escalate to human (pause automation, ring bell) ──
+        if action == 'escalate':
             self.total_interventions += 1
-            question = verdict.message or verdict.reasoning
+            question = message or reasoning
             self._notify(
-                f"[termiclaude] NEEDS YOUR INPUT: {question}",
+                f"[dedelulu] NEEDS YOUR INPUT: {question}",
                 'escalate')
-            # Pause auto-approvals until user types something
             self.idle_handled = True
             log_event('escalate', {
+                'trigger': trigger,
                 'question': question,
-                'reasoning': verdict.reasoning,
-                'intervention_count': self.total_interventions,
+                'reasoning': reasoning,
+                'stats': stats,
             })
             return
 
-        if verdict.action == 'interrupt':
+        # ── Stale trigger with no message → ask LLM what to say ──
+        if trigger == 'stale' and not message:
+            message = self._ask_stale_nudge(stats)
+            if message is None:
+                return  # LLM said SKIP or failed
+
+        if not message:
+            return
+
+        # ── Interrupt (Ctrl+C then message) ──
+        if action == 'interrupt':
             self.total_interventions += 1
             self._notify(
-                f"[termiclaude] INTERRUPTING: {verdict.status} — {verdict.reasoning}",
+                f"[dedelulu] INTERRUPTING: {status} — {reasoning}",
                 'alert')
-            # Send Ctrl+C to interrupt the agent
             try:
                 os.write(self.master_fd, b'\x03')
             except OSError:
                 pass
-            # If there's a redirect message, type it after a short pause
-            if verdict.message:
-                time.sleep(1)
-                try:
-                    os.write(self.master_fd, (verdict.message + '\r').encode())
-                except OSError:
-                    pass
-                self._notify(
-                    f"[termiclaude] sent redirect: {verdict.message[:80]}", 'info')
-            log_event('intervene', {
-                'type': 'interrupt',
-                'message': verdict.message,
-                'reasoning': verdict.reasoning,
-                'intervention_count': self.total_interventions,
-            })
-
-        elif verdict.action == 'message':
-            self.total_interventions += 1
+            time.sleep(1)
+            try:
+                os.write(self.master_fd, (message + '\r').encode())
+            except OSError:
+                pass
             self._notify(
-                f"[termiclaude] REDIRECTING: {verdict.reasoning}", 'alert')
-            # Type a message to the agent (it should be at a prompt)
-            if verdict.message:
-                try:
-                    os.write(self.master_fd, (verdict.message + '\r').encode())
-                except OSError:
-                    pass
-                self._notify(
-                    f"[termiclaude] sent: {verdict.message[:80]}", 'info')
-            log_event('intervene', {
-                'type': 'message',
-                'message': verdict.message,
-                'reasoning': verdict.reasoning,
-                'intervention_count': self.total_interventions,
-            })
+                f"[dedelulu] sent redirect: {message[:80]}", 'info')
+
+        # ── Message (type into agent prompt) ──
+        else:
+            self.total_interventions += 1
+            label = 'nudge' if trigger == 'stale' else 'redirect'
+            self._notify(
+                f"[dedelulu] {label}: {reasoning or message[:60]}", 'info')
+            try:
+                os.write(self.master_fd, (message + '\r').encode())
+            except OSError:
+                pass
+
+        self.idle_handled = False  # allow auto-approvals after intervention
+
+        log_event('intervene', {
+            'trigger': trigger,
+            'type': action,
+            'message': message,
+            'reasoning': reasoning,
+            'stats': stats,
+        })
+
+    def _ask_stale_nudge(self, stats: dict) -> Optional[str]:
+        """Ask LLM what to say to a stale agent. Returns message or None (skip)."""
+        raw_output = '\n'.join(self.full_buffer[-80:]) if self.full_buffer else ''
+        clean_output = strip_ansi(raw_output).strip() if raw_output else '(no recent output)'
+        sys_instr = self.system_instructions or _DEFAULT_SUPERVISOR_SYSTEM
+
+        prompt = f"""You are supervising an AI coding agent (Claude Code). It has gone stale.
+
+GOAL: {self.goal or '(no specific goal set)'}
+
+INSTRUCTIONS: {sys_instr}
+
+TIMING:
+- No output for {stats['since_output']}s ({stats['since_output'] // 60}min)
+- User last typed: {f"{stats['since_user_input']}s ago" if stats['since_user_input'] is not None else 'never this session'}
+- Total auto-responses so far: {stats['total_responses']}
+- Total interventions so far: {stats['total_interventions']}
+- Consecutive stuck detections: {stats['consecutive_stuck']}
+
+LAST AGENT OUTPUT:
+{clean_output[-2000:]}
+
+Write a SHORT encouraging message (1-2 sentences) to send to the agent.
+- If it finished: suggest verifying work or what to do next
+- If stuck: suggest a concrete next step
+- If clearly done and nothing needed: respond SKIP
+
+Reply with ONLY the message text (no quotes, no explanation)."""
+
+        try:
+            if self.provider == 'claude-cli':
+                raw = _ask_claude_cli(prompt, self.model)
+            elif self.provider == 'anthropic':
+                raw = _ask_anthropic(prompt, self.model or 'claude-haiku-4-5-20251001',
+                                     self.api_key or os.getenv('ANTHROPIC_API_KEY'))
+            elif self.provider == 'ollama':
+                raw = _ask_ollama(prompt, self.model or 'ministral-3:8b')
+            elif self.provider == 'openai':
+                raw = _ask_openai(prompt, self.model or 'gpt-4o-mini',
+                                  self.api_key or os.getenv('OPENAI_API_KEY'))
+            elif self.provider == 'azure':
+                raw = _ask_azure(prompt, self.model or 'gpt-4o-mini',
+                                 self.api_key or os.getenv('AZURE_OPENAI_API_KEY'))
+            else:
+                raw = None
+        except Exception as e:
+            log_event('stale_nudge_error', {'error': str(e)})
+            raw = None
+
+        if not raw:
+            return "Hey, looks like you've paused — please continue working on the task, or let me know if you're done!"
+
+        raw = raw.strip()
+        if raw.upper() == 'SKIP':
+            log_event('stale_skip', {'reason': 'LLM says agent is done'})
+            self._notify("[dedelulu] stale check: agent appears done, not nudging", 'ok')
+            return None
+
+        # Strip wrapping quotes
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+            raw = raw[1:-1]
+        return raw
 
     # ANSI color codes for notification levels
     _NOTIFY_STYLES = {
@@ -1571,11 +1702,11 @@ def _hook_stop():
         if verdict and verdict.action == 'escalate':
             msg = verdict.message or verdict.reasoning
             sys.stderr.write(
-                f"\r\n\x1b[1;33m[termiclaude] NEEDS YOUR INPUT: {msg}\x1b[0m\x07\r\n")
+                f"\r\n\x1b[1;33m[dedelulu] NEEDS YOUR INPUT: {msg}\x1b[0m\x07\r\n")
             sys.stderr.flush()
         elif verdict and verdict.action in ('interrupt', 'message'):
             sys.stderr.write(
-                f"\r\n\x1b[1;31m[termiclaude] SUPERVISOR: {verdict.reasoning}\x1b[0m\x07\r\n")
+                f"\r\n\x1b[1;31m[dedelulu] SUPERVISOR: {verdict.reasoning}\x1b[0m\x07\r\n")
             sys.stderr.flush()
 
     except Exception:
@@ -1606,49 +1737,54 @@ def main():
         _hook_post_tool_use()
     if len(sys.argv) >= 2 and sys.argv[1] == '--hook-stop':
         _hook_stop()
-    # Foreman mode: termiclaude --foreman <ipc_dir>
+    # Foreman mode: dedelulu --foreman <ipc_dir>
     if len(sys.argv) >= 3 and sys.argv[1] == '--foreman':
         run_foreman(sys.argv[2])
         sys.exit(0)
 
     parser = argparse.ArgumentParser(
-        prog='termiclaude',
+        prog='dedelulu',
         description='Autonomous supervisor for interactive CLI agents',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 usage:
   cd ~/your-project
-  termiclaude claude "refactor the auth module"
+  dedelulu claude "refactor the auth module"
 
-  That's it. termiclaude wraps claude (or any CLI), auto-approves
-  prompts, and logs every decision to termiclaude.jsonl.
+  That's it. dedelulu wraps claude (or any CLI), auto-approves
+  prompts, and logs every decision to dedelulu.jsonl.
 
-  With tmux installed, termiclaude auto-splits into two panes:
+  With tmux installed, dedelulu auto-splits into two panes:
     left 80%  = Claude Code (full passthrough, you see everything)
     right 20% = Foreman (status, logs, answers your questions)
 
 more examples:
-  termiclaude claude "add tests for auth"     # auto-approve, goal auto-extracted
-  termiclaude --idle 8 claude "big refactor"  # more patience before responding
-  termiclaude --dry-run claude "delete stuff" # see what it would approve
-  termiclaude --no-log npm init               # wrap any interactive CLI
-  termiclaude --no-tmux claude "quick fix"    # single-pane mode (no split)
+  dedelulu claude "add tests for auth"     # auto-approve, goal auto-extracted
+  dedelulu --idle 8 claude "big refactor"  # more patience before responding
+  dedelulu --dry-run claude "delete stuff" # see what it would approve
+  dedelulu --no-log npm init               # wrap any interactive CLI
+  dedelulu --no-tmux claude "quick fix"    # single-pane mode (no split)
 
 with supervisor (watches output, intervenes if agent goes off-rails):
-  termiclaude --provider ollama claude "add JWT auth"
-  termiclaude --provider ollama --supervise 30 claude "big refactor"
-  termiclaude --provider anthropic --goal "fix login bug" claude
+  dedelulu --provider ollama claude "add JWT auth"
+  dedelulu --provider ollama --supervise 30 claude "big refactor"
+  dedelulu --provider anthropic --goal "fix login bug" claude
 
-with system instructions (put termiclaude flags BEFORE the command):
-  termiclaude --system "always say yes" -- claude "refactor auth"
-  termiclaude --system "use screenshots" --goal "fix TUI" -- claude "fix it"
+stale agent nudging (auto-pokes agent if idle too long):
+  dedelulu --provider ollama claude "big refactor"       # nudge after 5min (default)
+  dedelulu --stale 600 --provider ollama claude "task"   # nudge after 10min
+  dedelulu --stale 0 --provider ollama claude "task"     # disable nudging
+
+with system instructions (put dedelulu flags BEFORE the command):
+  dedelulu --system "always say yes" -- claude "refactor auth"
+  dedelulu --system "use screenshots" --goal "fix TUI" -- claude "fix it"
         """
     )
 
     parser.add_argument('command', nargs=argparse.REMAINDER,
                         help='command to run and supervise (use -- before commands with flags)')
-    # NOTE: termiclaude flags (--system, --goal, etc) must come BEFORE the command.
-    # Use -- to separate: termiclaude --system "..." -- claude "prompt"
+    # NOTE: dedelulu flags (--system, --goal, etc) must come BEFORE the command.
+    # Use -- to separate: dedelulu --system "..." -- claude "prompt"
     parser.add_argument('--idle', type=float, default=4.0,
                         help='seconds of silence before checking for prompt (default: 4)')
     parser.add_argument('--provider',
@@ -1660,8 +1796,8 @@ with system instructions (put termiclaude flags BEFORE the command):
     parser.add_argument('--api-key', help='API key (or use env var)')
     parser.add_argument('--dry-run', action='store_true',
                         help='detect prompts but don\'t send responses')
-    parser.add_argument('--log', default='termiclaude.jsonl',
-                        help='log file path (default: termiclaude.jsonl)')
+    parser.add_argument('--log', default='dedelulu.jsonl',
+                        help='log file path (default: dedelulu.jsonl)')
     parser.add_argument('--no-log', action='store_true',
                         help='disable logging')
     parser.add_argument('--max-responses', type=int, default=0,
@@ -1681,6 +1817,9 @@ with system instructions (put termiclaude flags BEFORE the command):
     parser.add_argument('--system', metavar='TEXT',
                         help='extra instructions for the supervisor LLM '
                              '(e.g. "always answer no", "choose option 2")')
+    parser.add_argument('--stale', type=float, default=300.0, metavar='SECS',
+                        help='seconds of inactivity before nudging stale agent '
+                             '(default: 300 = 5min, 0=off)')
     parser.add_argument('--ipc-dir',
                         help=argparse.SUPPRESS)  # internal: set by tmux launcher
 
@@ -1693,7 +1832,7 @@ with system instructions (put termiclaude flags BEFORE the command):
         else:
             args.provider = 'none'
             sys.stderr.write(
-                "\x1b[33m[termiclaude] AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT not set.\n"
+                "\x1b[33m[dedelulu] AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT not set.\n"
                 "  Running without LLM supervisor (pattern-only).\n"
                 "  To enable: export AZURE_OPENAI_API_KEY=... AZURE_OPENAI_ENDPOINT=...\n"
                 "  Or use: --provider ollama / --provider anthropic\x1b[0m\n"
@@ -1750,6 +1889,7 @@ with system instructions (put termiclaude flags BEFORE the command):
         ipc_dir=args.ipc_dir,
         llm_only=args.llm_only,
         system_instructions=args.system,
+        stale_timeout=args.stale,
     )
 
     exit_code = sup.start()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test interactive app to validate termiclaude's auto-response."""
+"""Test interactive app to validate dedelulu's auto-response."""
 
 import time
 import sys
