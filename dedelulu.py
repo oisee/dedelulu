@@ -650,6 +650,96 @@ class IPC:
 
 
 # =============================================================================
+# Registry — discover all dedelulu instances on this machine
+# =============================================================================
+
+class Registry:
+    """Scans /tmp for live dedelulu sessions and their workers."""
+
+    SESSION_GLOB = os.path.join(tempfile.gettempdir(), 'dedelulu_session_*')
+
+    @classmethod
+    def discover(cls) -> list[dict]:
+        """Return list of live workers across all sessions on this machine.
+
+        Each entry: {session_dir, session_id, worker_name, task, directory, pid, alive, ipc_dir}
+        """
+        import glob as _glob
+        results = []
+        for session_dir in sorted(_glob.glob(cls.SESSION_GLOB)):
+            session_file = os.path.join(session_dir, 'session.json')
+            if not os.path.isfile(session_file):
+                continue
+            try:
+                with open(session_file) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            session_id = os.path.basename(session_dir).replace('dedelulu_session_', '')
+
+            for wd in data.get('workers', []):
+                ipc_dir = wd.get('ipc_dir', '')
+                pid_path = os.path.join(ipc_dir, 'pid') if ipc_dir else ''
+                pid = None
+                alive = False
+                if pid_path and os.path.isfile(pid_path):
+                    try:
+                        with open(pid_path) as f:
+                            pid = int(f.read().strip())
+                        os.kill(pid, 0)
+                        alive = True
+                    except (ValueError, ProcessLookupError, PermissionError, OSError):
+                        pass
+
+                results.append({
+                    'session_dir': session_dir,
+                    'session_id': session_id,
+                    'worker_name': wd.get('name', '?'),
+                    'task': wd.get('task', ''),
+                    'directory': wd.get('directory', ''),
+                    'pid': pid,
+                    'alive': alive,
+                    'ipc_dir': ipc_dir,
+                })
+        return results
+
+    @classmethod
+    def find_target(cls, target: str, prefer_session: str = None) -> list[dict]:
+        """Find workers matching a target spec.
+
+        Target can be:
+          - "worker_name" — matches by name (prefer same session if set)
+          - "session_id:worker_name" — exact match
+          - "all" — all live workers
+        """
+        all_workers = cls.discover()
+        live = [w for w in all_workers if w['alive']]
+
+        if target == 'all':
+            return live
+
+        # session_id:worker_name format
+        if ':' in target:
+            sid, wname = target.split(':', 1)
+            return [w for w in live
+                    if w['session_id'].startswith(sid) and w['worker_name'] == wname]
+
+        # Plain worker name — collect all matches
+        matches = [w for w in live if w['worker_name'] == target]
+        if len(matches) <= 1:
+            return matches
+
+        # Multiple matches: prefer same session
+        if prefer_session:
+            same = [w for w in matches if w['session_dir'] == prefer_session]
+            if same:
+                return same
+
+        return matches
+
+
+# =============================================================================
 # Session — multi-worker state on disk (shared by foreman + workers)
 # =============================================================================
 
@@ -1545,8 +1635,10 @@ class Supervisor:
                         log_event('stale_config', {'timeout': new_timeout})
                     elif msg.get('message'):
                         response_text = msg['message']
+                        sender = msg.get('sender', 'foreman')
                         try:
-                            os.write(self.master_fd, (response_text + '\r').encode())
+                            formatted = self._format_agent_message(response_text, sender=sender)
+                            os.write(self.master_fd, (formatted + '\r').encode())
                         except OSError:
                             pass
                         self.idle_handled = False  # resume auto-approvals
@@ -1841,6 +1933,19 @@ class Supervisor:
             'consecutive_stuck': self.consecutive_stuck,
         }
 
+    def _format_agent_message(self, message: str, sender: str = '') -> str:
+        """Wrap a message with sender prefix and reply instructions.
+
+        Example output:
+            [from:ofslt9t_:auth] Fix the auth bug.
+            (to reply: ddll send ofslt9t_:auth <your message>)
+        """
+        sender = sender or 'foreman'
+        return (
+            f"[from:{sender}] {message}\n"
+            f"(to reply: ddll send {sender} <your message>)"
+        )
+
     def _intervene(self, trigger: str, action: str = 'message',
                    message: str = '', reasoning: str = '', status: str = ''):
         """Level 3: actually send messages / interrupts to the agent.
@@ -1896,7 +2001,8 @@ class Supervisor:
                 pass
             time.sleep(1)
             try:
-                os.write(self.master_fd, (message + '\r').encode())
+                formatted = self._format_agent_message(message)
+                os.write(self.master_fd, (formatted + '\r').encode())
             except OSError:
                 pass
             self._notify(
@@ -1909,7 +2015,8 @@ class Supervisor:
             self._notify(
                 f"[dedelulu] {label}: {reasoning or message[:60]}", 'info')
             try:
-                os.write(self.master_fd, (message + '\r').encode())
+                formatted = self._format_agent_message(message)
+                os.write(self.master_fd, (formatted + '\r').encode())
             except OSError:
                 pass
 
@@ -2200,6 +2307,14 @@ def main():
         _hook_post_tool_use()
     if len(sys.argv) >= 2 and sys.argv[1] == '--hook-stop':
         _hook_stop()
+    # Subcommands: explore, send
+    if len(sys.argv) >= 2 and sys.argv[1] == 'explore':
+        explore_main()
+        sys.exit(0)
+    if len(sys.argv) >= 2 and sys.argv[1] == 'send':
+        sys.argv = [sys.argv[0]] + sys.argv[2:]  # strip 'send' so send_main sees target+msg
+        send_main()
+        sys.exit(0)
     # Foreman mode: dedelulu --foreman <ipc_dir>
     if len(sys.argv) >= 3 and sys.argv[1] == '--foreman':
         run_foreman(sys.argv[2])
@@ -2412,40 +2527,95 @@ with system instructions (put dedelulu flags BEFORE the command):
     sys.exit(exit_code)
 
 
-def send_main():
-    """Entry point for dedelulu-send: send a message to another worker.
+def explore_main():
+    """Entry point for dedelulu explore: list all live dedelulu instances.
 
-    Usage: dedelulu-send <worker-name> <message>
-    Uses DEDELULU_SESSION env var to find the session.
+    Usage: dedelulu explore [--json]
+    """
+    use_json = '--json' in sys.argv
+
+    workers = Registry.discover()
+    live = [w for w in workers if w['alive']]
+
+    if not live:
+        if use_json:
+            print('[]')
+        else:
+            print("no live dedelulu instances found")
+        sys.exit(0)
+
+    if use_json:
+        print(json.dumps(live, indent=2))
+        sys.exit(0)
+
+    # Table output
+    fmt = '{:<12} {:<12} {:<8} {:<30} {}'
+    print(fmt.format('SESSION', 'WORKER', 'PID', 'DIR', 'TASK'))
+    print(fmt.format('─' * 12, '─' * 12, '─' * 8, '─' * 30, '─' * 30))
+    for w in live:
+        sid = w['session_id'][:12]
+        directory = w['directory']
+        # Shorten home dir
+        home = os.path.expanduser('~')
+        if directory.startswith(home):
+            directory = '~' + directory[len(home):]
+        print(fmt.format(
+            sid, w['worker_name'], str(w['pid'] or '?'),
+            directory[:30], w['task'][:50],
+        ))
+
+
+def send_main():
+    """Entry point for dedelulu send: send a message to any dedelulu instance.
+
+    Usage: dedelulu send <target> <message>
+
+    Target can be:
+      worker_name          — by name (unique or same-session preferred)
+      session_id:worker    — disambiguate across sessions
+      all                  — broadcast to every live worker
     """
     if len(sys.argv) < 3:
-        print("usage: dedelulu-send <worker-name> <message>", file=sys.stderr)
-        sys.exit(1)
-
-    session_dir = os.environ.get('DEDELULU_SESSION')
-    if not session_dir:
-        print("error: DEDELULU_SESSION not set (are you running inside dedelulu?)",
-              file=sys.stderr)
+        print("usage: dedelulu send <target> <message>", file=sys.stderr)
+        print("       target: worker_name | session_id:worker | all", file=sys.stderr)
         sys.exit(1)
 
     target = sys.argv[1]
     message = ' '.join(sys.argv[2:])
+    worker_name = os.environ.get('DEDELULU_WORKER', 'external')
+    prefer_session = os.environ.get('DEDELULU_SESSION')
 
-    try:
-        session = Session.load(session_dir)
-    except Exception as e:
-        print(f"error: cannot load session: {e}", file=sys.stderr)
+    # Build fully-qualified sender so recipient knows who sent it and can reply
+    if prefer_session:
+        session_id = os.path.basename(prefer_session).replace('dedelulu_session_', '')
+        sender = f"{session_id[:8]}:{worker_name}"
+    else:
+        sender = worker_name
+
+    matches = Registry.find_target(target, prefer_session=prefer_session)
+
+    if not matches:
+        # Show available targets to help
+        live = [w for w in Registry.discover() if w['alive']]
+        if live:
+            available = ', '.join(
+                f"{w['session_id'][:8]}:{w['worker_name']}" for w in live)
+            print(f"error: no live worker matching '{target}' (available: {available})",
+                  file=sys.stderr)
+        else:
+            print(f"error: no live dedelulu instances found", file=sys.stderr)
         sys.exit(1)
 
-    if target not in session.workers:
-        available = ', '.join(session.workers.keys())
-        print(f"error: unknown worker '{target}' (available: {available})",
+    if len(matches) > 1 and target != 'all':
+        print(f"warning: '{target}' matches {len(matches)} workers, sending to all:",
               file=sys.stderr)
-        sys.exit(1)
+        for w in matches:
+            print(f"  {w['session_id'][:8]}:{w['worker_name']}", file=sys.stderr)
 
-    sender = os.environ.get('DEDELULU_WORKER', 'unknown')
-    session.send_to_worker(target, message, sender=sender)
-    print(f"sent to [{target}]")
+    for w in matches:
+        ipc = IPC(w['ipc_dir'])
+        ipc.send_input(message, sender=sender)
+        print(f"sent to [{w['session_id'][:8]}:{w['worker_name']}]")
 
 
 if __name__ == '__main__':
