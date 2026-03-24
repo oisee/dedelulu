@@ -288,6 +288,11 @@ def _handle_command(raw: str, session: Session, worker_color: dict,
     /status                         — worker status overview
     /focus <worker>                 — switch tmux to worker pane
     /log <worker>                   — last 15 events from worker
+    /stale <worker|all> [secs]     — enable stale nudge (default 300s, 0=off)
+    /hide                           — minimize foreman pane
+    /show                           — restore foreman pane
+    Prefix+F                        — toggle foreman pane (from any pane)
+    Prefix+f                        — focus foreman pane
     /help                           — this help
 """)
 
@@ -398,6 +403,32 @@ def _handle_command(raw: str, session: Session, worker_color: dict,
         except Exception as e:
             print(f"  {C_RED}error: {e}{C_RESET}")
 
+    elif cmd == '/stale':
+        if len(parts) < 2:
+            print(f"  {C_GRAY}usage: /stale <worker|all> [secs]  (default 300, 0=off){C_RESET}")
+        else:
+            target = parts[1]
+            secs = float(parts[2]) if len(parts) >= 3 else 300.0
+            targets = list(session.workers.keys()) if target == 'all' else [target]
+            for name in targets:
+                if name not in session.workers:
+                    print(f"  {C_RED}unknown worker: {name}{C_RESET}")
+                    continue
+                w = session.workers[name]
+                ipc = IPC(w.ipc_dir)
+                ipc.send_input('', command='stale', value=str(secs))
+                wc = worker_color.get(name, '')
+                label = f'{int(secs)}s' if secs > 0 else 'off'
+                print(f"  {wc}[{name}]{C_RESET} stale nudge → {label}")
+
+    elif cmd == '/hide':
+        subprocess.run(['tmux', 'resize-pane', '-y', '2'], capture_output=True)
+        print(f"  {C_GRAY}foreman minimized (/show to restore){C_RESET}")
+
+    elif cmd == '/show':
+        subprocess.run(['tmux', 'resize-pane', '-y', '35%'], capture_output=True)
+        print(f"  {C_GREEN}foreman restored{C_RESET}")
+
     else:
         print(f"  {C_GRAY}unknown command. /help for list{C_RESET}")
 
@@ -468,7 +499,24 @@ def launch_multi_tmux(session: Session, extra_args: list[str]):
 
     # Focus on foreman (last pane)
     total_panes = len(workers) + 1
-    subprocess.run([tmux, 'select-pane', '-t', f'{session_name}:{0}.{total_panes - 1}'])
+    foreman_pane = total_panes - 1
+    subprocess.run([tmux, 'select-pane', '-t', f'{session_name}:{0}.{foreman_pane}'])
+
+    # Keybindings for foreman panel toggle (works from any pane)
+    # Prefix+F = toggle foreman: if foreman is tiny → restore, else → minimize
+    # Prefix+f = focus/select foreman pane
+    toggle_cmd = (
+        f'if [ "$(tmux display -p -t {session_name}:{0}.{foreman_pane} "#{{pane_height}}")" -le 3 ]; then '
+        f'tmux resize-pane -t {session_name}:{0}.{foreman_pane} -y 35%; '
+        f'else '
+        f'tmux resize-pane -t {session_name}:{0}.{foreman_pane} -y 2; '
+        f'fi'
+    )
+    subprocess.run([tmux, 'bind-key', '-T', 'prefix', 'F',
+                    'run-shell', toggle_cmd], capture_output=True)
+    subprocess.run([tmux, 'bind-key', '-T', 'prefix', 'f',
+                    'select-pane', '-t', f'{session_name}:{0}.{foreman_pane}'],
+                   capture_output=True)
 
     # Attach
     os.execvp(tmux, [tmux, 'attach-session', '-t', session_name])
@@ -514,8 +562,8 @@ examples:
     parser.add_argument('--model', help='specific model for supervisor')
     parser.add_argument('--idle', type=float, default=4.0)
     parser.add_argument('--supervise', type=float, default=0, metavar='SECS')
-    parser.add_argument('--stale', type=float, default=300.0, metavar='SECS',
-                        help='seconds of inactivity before nudging stale agent (default: 300)')
+    parser.add_argument('--stale', type=float, default=0, metavar='SECS',
+                        help='seconds of inactivity before nudging stale agent (default: 0=off)')
     parser.add_argument('--no-hooks', action='store_true')
     parser.add_argument('--log', default='dedelulu.jsonl')
     parser.add_argument('--no-log', action='store_true')
@@ -552,7 +600,7 @@ examples:
         extra_args += ['--idle', str(args.idle)]
     if args.supervise > 0:
         extra_args += ['--supervise', str(args.supervise)]
-    if args.stale != 300.0:
+    if args.stale != 0:
         extra_args += ['--stale', str(args.stale)]
     if args.no_hooks:
         extra_args.append('--no-hooks')

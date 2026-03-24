@@ -1171,10 +1171,10 @@ def set_winsize(fd: int, rows: int, cols: int):
 # =============================================================================
 
 _DEFAULT_SUPERVISOR_SYSTEM = (
-    "Please support and encourage our agent gently. "
-    "Help if it is stuck, suggest creative and solid solutions if you know better, "
-    "and help to unstuck if it is stale. "
-    "Be concise and actionable — one or two sentences max."
+    "You are a supervisor that approves or denies tool actions. "
+    "By default, approve safe actions and deny dangerous ones "
+    "(e.g. deleting production data, force-pushing, rm -rf /). "
+    "Do NOT send unsolicited messages or motivational nudges to the agent."
 )
 
 
@@ -1187,7 +1187,7 @@ class Supervisor:
                  no_hooks: bool = False, ipc_dir: str = None,
                  llm_only: bool = False,
                  system_instructions: str = None,
-                 stale_timeout: float = 300.0,
+                 stale_timeout: float = 0,
                  session_dir: str = None,
                  worker_name: str = 'main'):
         self.command = command
@@ -1532,18 +1532,26 @@ class Supervisor:
                         self._intervene(trigger='stale', reasoning='agent stale, no activity')
                     self.last_stale_nudge_time = now
 
-            # Poll foreman input (escalation responses)
+            # Poll foreman input (escalation responses + commands)
             if self.ipc:
                 msg = self.ipc.poll_input()
-                if msg and msg.get('message'):
-                    response_text = msg['message']
-                    try:
-                        os.write(self.master_fd, (response_text + '\r').encode())
-                    except OSError:
-                        pass
-                    self.idle_handled = False  # resume auto-approvals
-                    self._notify(f"[dedelulu] foreman response: {response_text[:60]}", 'info')
-                    log_event('foreman_response', {'message': response_text})
+                if msg:
+                    if msg.get('command') == 'stale':
+                        new_timeout = float(msg.get('value', 300))
+                        self.stale_timeout = new_timeout
+                        self.last_stale_nudge_time = 0.0
+                        label = f'{int(new_timeout)}s' if new_timeout > 0 else 'off'
+                        self._notify(f"[dedelulu] stale nudge: {label}", 'info')
+                        log_event('stale_config', {'timeout': new_timeout})
+                    elif msg.get('message'):
+                        response_text = msg['message']
+                        try:
+                            os.write(self.master_fd, (response_text + '\r').encode())
+                        except OSError:
+                            pass
+                        self.idle_handled = False  # resume auto-approvals
+                        self._notify(f"[dedelulu] foreman response: {response_text[:60]}", 'info')
+                        log_event('foreman_response', {'message': response_text})
 
             # Check if child exited
             try:
@@ -1968,8 +1976,11 @@ TIMING:
 AGENT CONTEXT:
 {context[-3000:]}
 
-Talk like a helpful colleague, not a system. Be natural and concise (1-2 sentences).
-Reply with ONLY the message text (no quotes, no explanation). Or SKIP if done."""
+RULES:
+- Match the language the user/agent are using (if they speak Russian, write in Russian, etc.)
+- Do NOT repeat or rephrase previous messages — try a completely different angle
+- Talk like a helpful colleague, not a system. Be natural and concise (1-2 sentences)
+- Reply with ONLY the message text (no quotes, no explanation). Or SKIP if done."""
 
         try:
             if self.provider == 'claude-cli':
@@ -2212,10 +2223,10 @@ with supervisor (watches output, intervenes if agent goes off-rails):
   dedelulu --provider ollama --supervise 30 claude "big refactor"
   dedelulu --provider anthropic --goal "fix login bug" claude
 
-stale agent nudging (auto-pokes agent if idle too long):
-  dedelulu --provider ollama claude "big refactor"       # nudge after 5min (default)
+stale agent nudging (off by default, enable via --stale or /stale in foreman):
+  dedelulu --stale 300 --provider ollama claude "task"   # nudge after 5min
   dedelulu --stale 600 --provider ollama claude "task"   # nudge after 10min
-  dedelulu --stale 0 --provider ollama claude "task"     # disable nudging
+  # or enable at runtime from foreman: /stale worker1 300
 
 multi-agent (add workers dynamically from foreman pane):
   dedelulu claude "build the API"
@@ -2268,9 +2279,9 @@ with system instructions (put dedelulu flags BEFORE the command):
     parser.add_argument('--system', metavar='TEXT',
                         help='extra instructions for the supervisor LLM '
                              '(e.g. "always answer no", "choose option 2")')
-    parser.add_argument('--stale', type=float, default=300.0, metavar='SECS',
+    parser.add_argument('--stale', type=float, default=0, metavar='SECS',
                         help='seconds of inactivity before nudging stale agent '
-                             '(default: 300 = 5min, 0=off)')
+                             '(default: 0=off, e.g. 300 for 5min)')
     parser.add_argument('--name', default='main',
                         help='worker name for multi-agent sessions (default: main)')
     parser.add_argument('--ipc-dir',
@@ -2324,7 +2335,7 @@ with system instructions (put dedelulu flags BEFORE the command):
         extra_args += ['--idle', str(args.idle)]
     if args.supervise > 0:
         extra_args += ['--supervise', str(args.supervise)]
-    if args.stale != 300.0:
+    if args.stale != 0:
         extra_args += ['--stale', str(args.stale)]
     if args.no_hooks:
         extra_args.append('--no-hooks')
