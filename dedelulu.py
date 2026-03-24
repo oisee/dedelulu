@@ -299,10 +299,11 @@ AGENT CONTEXT (activity timeline + recent terminal output):
 {recent_output}
 
 Assess the agent's status and respond in EXACTLY this JSON format (no other text):
-{{"status": "<on_track|stuck|off_rails|error_loop|idle|uncertain>", "action": "<continue|interrupt|message|escalate>", "message": "<text to type if action is message, or question for human if escalate, or empty>", "reasoning": "<1 sentence explanation>"}}
+{{"status": "<on_track|waiting|stuck|off_rails|error_loop|idle|uncertain>", "action": "<continue|interrupt|message|escalate>", "message": "<text to type if action is message, or question for human if escalate, or empty>", "reasoning": "<1 sentence explanation>"}}
 
 RULES:
 - "on_track" + "continue": agent is making progress toward the goal. This is the most common case.
+- "waiting" + "continue": agent is waiting for a background task, long-running command, build, or external process. This is NORMAL — do NOT intervene.
 {stuck_rule}
 - "off_rails" + "message": agent is working on something unrelated to the goal. message should redirect it.
 {error_rule}
@@ -311,6 +312,7 @@ RULES:
 - Be conservative — only interrupt if clearly stuck/wrong. False positives are worse than being patient.
 - Use "escalate" when the situation is ambiguous or risky — let the human decide.
 - If you see the agent actively writing code, running tests, reading files — that's "on_track".
+- If the agent is waiting for a background task, build, long-running command, or says "waiting" / "let me wait" — that's "waiting" + "continue". Do NOT interrupt.
 - If the agent is idle/waiting at a prompt and the goal is open-ended or unclear — that's "idle" + "continue". Do NOT nag.
 - If you already sent a message and the agent acknowledged it — do NOT repeat yourself. That's "on_track" or "idle".
 - NEVER repeat the same message. Each intervention must be DIFFERENT — try a new angle, suggest a concrete next step, or ask a specific question. Vary your tone and approach like a real colleague would.
@@ -1048,8 +1050,14 @@ def _foreman_command(raw: str, session: Session, session_dir: str,
         new_system = ' '.join(parts[1:])
         session.system_instructions = new_system
         session.save()
-        # Notify all workers by writing to their state
-        print(f"  {C_GREEN}✓{C_RESET} system instructions updated")
+        # Push to all running workers via IPC
+        for name in session.workers:
+            try:
+                ipc = session.get_ipc(name)
+                ipc.send_input('', command='system', value=new_system)
+            except Exception:
+                pass
+        print(f"  {C_GREEN}✓{C_RESET} system instructions updated (pushed to workers)")
         print(f"  {C_GRAY}{new_system[:80]}{C_RESET}")
 
     elif cmd == '/status':
@@ -1633,6 +1641,11 @@ class Supervisor:
                         label = f'{int(new_timeout)}s' if new_timeout > 0 else 'off'
                         self._notify(f"[dedelulu] stale nudge: {label}", 'info')
                         log_event('stale_config', {'timeout': new_timeout})
+                    elif msg.get('command') == 'system':
+                        self.system_instructions = msg.get('value', '')
+                        label = self.system_instructions[:60] or '(cleared)'
+                        self._notify(f"[dedelulu] system instructions: {label}", 'info')
+                        log_event('system_update', {'instructions': self.system_instructions})
                     elif msg.get('message'):
                         response_text = msg['message']
                         sender = msg.get('sender', 'foreman')
