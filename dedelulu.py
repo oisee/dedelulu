@@ -1516,7 +1516,7 @@ class Supervisor:
                     self.last_supervise_time = now
 
             # Stale agent detection — nudge if idle too long and user not typing
-            if self.stale_timeout > 0 and self.provider != 'none':
+            if self.stale_timeout > 0:
                 now = time.time()
                 time_since_output = now - self.last_output_time
                 time_since_user = now - self.last_user_input_time if self.last_user_input_time else float('inf')
@@ -1871,6 +1871,11 @@ class Supervisor:
             return
 
         # ── Stale trigger with no message → ask LLM what to say ──
+        if trigger.startswith('stale') and not message and self.provider == 'none':
+            # No LLM provider — just notify the user, don't spam the agent
+            self._notify("[dedelulu] agent appears stale — check on it?", 'alert')
+            log_event('stale_notify', {'trigger': trigger, 'reason': 'no LLM provider'})
+            return
         if trigger.startswith('stale') and not message:
             message = self._ask_stale_nudge(stats, at_prompt=(trigger == 'stale_at_prompt'))
             if message is None:
@@ -2003,7 +2008,8 @@ RULES:
             raw = None
 
         if not raw:
-            return "Hey, looks like you've paused — please continue working on the task, or let me know if you're done!"
+            log_event('stale_nudge_skip', {'reason': 'LLM returned empty response'})
+            return None
 
         raw = raw.strip()
         if raw.upper() == 'SKIP':
