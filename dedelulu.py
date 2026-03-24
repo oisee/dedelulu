@@ -1982,9 +1982,13 @@ AGENT CONTEXT:
 {context[-3000:]}
 
 RULES:
-- Match the language the user/agent are using (if they speak Russian, write in Russian, etc.)
-- Do NOT repeat or rephrase previous messages — try a completely different angle
-- Talk like a helpful colleague, not a system. Be natural and concise (1-2 sentences)
+- MIMIC THE USER'S STYLE: look at how the user writes in the terminal output above —
+  their language, tone, level of formality, emoji usage, slang. Write your nudge the
+  same way. If the user writes casually in Russian with "ахаха" and "=)", do that.
+  If they write formal English, do that. You are pretending to be the user.
+- Do NOT repeat or rephrase previous messages — try a completely different angle each time
+- Be specific and actionable — reference actual files, functions, or tasks from the context
+- 1-2 sentences max
 - Reply with ONLY the message text (no quotes, no explanation). Or SKIP if done."""
 
         try:
