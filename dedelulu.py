@@ -2350,7 +2350,7 @@ usage:
     right 20% = Foreman (status, logs, answers your questions)
 
 styles (presets for common supervision modes):
-  dedelulu --style hands-off claude "task"   # approve/deny only, no LLM
+  dedelulu --style auto claude "task"   # approve/deny only, no LLM
   dedelulu --style passive claude "task"     # LLM answers questions, never pokes
   dedelulu --style active claude "task"      # watches + nudges if stuck (default with --goal)
   dedelulu --style strict claude "task"      # short leash, frequent checks
@@ -2358,7 +2358,7 @@ styles (presets for common supervision modes):
   ┌────────────┬──────────┬───────────┬─────────┬──────────────────────────────────┐
   │ Style      │ Provider │ Supervise │ Stale   │ Behavior                         │
   ├────────────┼──────────┼───────────┼─────────┼──────────────────────────────────┤
-  │ hands-off  │ none     │ off       │ off     │ approve/deny only, no LLM        │
+  │ auto  │ none     │ off       │ off     │ approve/deny only, no LLM        │
   │ passive    │ auto     │ off       │ off     │ answers questions, never pokes    │
   │ active     │ auto     │ 120s      │ 300s    │ watches output, nudges if stuck   │
   │ strict     │ auto     │ 30s       │ 120s    │ short leash, frequent checks      │
@@ -2402,10 +2402,10 @@ with system instructions (put dedelulu flags BEFORE the command):
     # NOTE: dedelulu flags (--system, --goal, etc) must come BEFORE the command.
     # Use -- to separate: dedelulu --system "..." -- claude "prompt"
     parser.add_argument('--style',
-                        choices=['hands-off', 'passive', 'active', 'strict'],
+                        choices=['auto', 'passive', 'active', 'strict'],
                         default=None,
                         help='supervision style preset '
-                             '(hands-off | passive | active | strict)')
+                             '(auto | passive | active | strict)')
     parser.add_argument('--idle', type=float, default=4.0,
                         help='seconds of silence before checking for prompt (default: 4)')
     parser.add_argument('--provider',
@@ -2454,7 +2454,7 @@ with system instructions (put dedelulu flags BEFORE the command):
     # Style sets defaults; any explicit flag takes precedence.
     #
     #   Style       Provider   Supervise  Stale   Behavior
-    #   hands-off   none       off        off     approve/deny only, no LLM
+    #   auto   none       off        off     approve/deny only, no LLM
     #   passive     auto       off        off     LLM answers questions, never pokes
     #   active      auto       120s       300s    watches + nudges if stuck
     #   strict      auto       30s        120s    short leash, frequent checks
@@ -2467,7 +2467,7 @@ with system instructions (put dedelulu flags BEFORE the command):
         _has_stale = '--stale' in _argv
         style = args.style
 
-        if style == 'hands-off':
+        if style == 'auto':
             if not _has_provider:
                 args.provider = 'none'
             if not _has_supervise:
@@ -2524,10 +2524,10 @@ with system instructions (put dedelulu flags BEFORE the command):
             goal = ' '.join(non_flag_args)
 
     # If goal provided but no supervise interval, default to 120s
-    # (unless style explicitly set supervise to 0, e.g. passive/hands-off)
+    # (unless style explicitly set supervise to 0, e.g. passive/auto)
     supervise_interval = args.supervise
     if goal and supervise_interval == 0 and args.provider != 'none':
-        if args.style not in ('hands-off', 'passive'):
+        if args.style not in ('auto', 'passive'):
             supervise_interval = 120.0
 
     # Build extra_args to pass when spawning new workers via /add
