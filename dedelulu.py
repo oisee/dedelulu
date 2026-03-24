@@ -2349,6 +2349,22 @@ usage:
     left 80%  = Claude Code (full passthrough, you see everything)
     right 20% = Foreman (status, logs, answers your questions)
 
+styles (presets for common supervision modes):
+  dedelulu --style hands-off claude "task"   # approve/deny only, no LLM
+  dedelulu --style passive claude "task"     # LLM answers questions, never pokes
+  dedelulu --style active claude "task"      # watches + nudges if stuck (default with --goal)
+  dedelulu --style strict claude "task"      # short leash, frequent checks
+
+  ┌────────────┬──────────┬───────────┬─────────┬──────────────────────────────────┐
+  │ Style      │ Provider │ Supervise │ Stale   │ Behavior                         │
+  ├────────────┼──────────┼───────────┼─────────┼──────────────────────────────────┤
+  │ hands-off  │ none     │ off       │ off     │ approve/deny only, no LLM        │
+  │ passive    │ auto     │ off       │ off     │ answers questions, never pokes    │
+  │ active     │ auto     │ 120s      │ 300s    │ watches output, nudges if stuck   │
+  │ strict     │ auto     │ 30s       │ 120s    │ short leash, frequent checks      │
+  └────────────┴──────────┴───────────┴─────────┴──────────────────────────────────┘
+  explicit flags (--supervise, --stale, --provider) override style defaults.
+
 more examples:
   dedelulu claude "add tests for auth"     # auto-approve, goal auto-extracted
   dedelulu --idle 8 claude "big refactor"  # more patience before responding
@@ -2385,6 +2401,11 @@ with system instructions (put dedelulu flags BEFORE the command):
                         help='command to run and supervise (use -- before commands with flags)')
     # NOTE: dedelulu flags (--system, --goal, etc) must come BEFORE the command.
     # Use -- to separate: dedelulu --system "..." -- claude "prompt"
+    parser.add_argument('--style',
+                        choices=['hands-off', 'passive', 'active', 'strict'],
+                        default=None,
+                        help='supervision style preset '
+                             '(hands-off | passive | active | strict)')
     parser.add_argument('--idle', type=float, default=4.0,
                         help='seconds of silence before checking for prompt (default: 4)')
     parser.add_argument('--provider',
@@ -2429,6 +2450,50 @@ with system instructions (put dedelulu flags BEFORE the command):
 
     args = parser.parse_args()
 
+    # ── Style presets (explicit flags override) ──
+    # Style sets defaults; any explicit flag takes precedence.
+    #
+    #   Style       Provider   Supervise  Stale   Behavior
+    #   hands-off   none       off        off     approve/deny only, no LLM
+    #   passive     auto       off        off     LLM answers questions, never pokes
+    #   active      auto       120s       300s    watches + nudges if stuck
+    #   strict      auto       30s        120s    short leash, frequent checks
+    #
+    if args.style:
+        # Check which flags the user explicitly passed on the command line
+        _argv = sys.argv
+        _has_provider = '--provider' in _argv
+        _has_supervise = '--supervise' in _argv
+        _has_stale = '--stale' in _argv
+        style = args.style
+
+        if style == 'hands-off':
+            if not _has_provider:
+                args.provider = 'none'
+            if not _has_supervise:
+                args.supervise = 0
+            if not _has_stale:
+                args.stale = 0
+
+        elif style == 'passive':
+            # LLM available but never proactive
+            if not _has_supervise:
+                args.supervise = 0
+            if not _has_stale:
+                args.stale = 0
+
+        elif style == 'active':
+            if not _has_supervise:
+                args.supervise = 120.0
+            if not _has_stale:
+                args.stale = 300.0
+
+        elif style == 'strict':
+            if not _has_supervise:
+                args.supervise = 30.0
+            if not _has_stale:
+                args.stale = 120.0
+
     # Auto-detect provider: azure if env vars present, else none
     if args.provider is None:
         if os.getenv('AZURE_OPENAI_API_KEY') and os.getenv('AZURE_OPENAI_ENDPOINT'):
@@ -2458,13 +2523,17 @@ with system instructions (put dedelulu flags BEFORE the command):
         if non_flag_args:
             goal = ' '.join(non_flag_args)
 
-    # If goal provided but no supervise interval, default to 60s
+    # If goal provided but no supervise interval, default to 120s
+    # (unless style explicitly set supervise to 0, e.g. passive/hands-off)
     supervise_interval = args.supervise
     if goal and supervise_interval == 0 and args.provider != 'none':
-        supervise_interval = 120.0
+        if args.style not in ('hands-off', 'passive'):
+            supervise_interval = 120.0
 
     # Build extra_args to pass when spawning new workers via /add
     extra_args = []
+    if args.style:
+        extra_args += ['--style', args.style]
     if args.provider and args.provider != 'none':
         extra_args += ['--provider', args.provider]
     if args.model:
