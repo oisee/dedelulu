@@ -1946,6 +1946,9 @@ class Supervisor:
                         try:
                             formatted = self._format_agent_message(response_text, sender=sender)
                             os.write(self.master_fd, (formatted + '\r').encode())
+                            # Claude Code collapses long pastes into "[pasted text]"
+                            # and waits for Enter — send an extra \r after a short delay
+                            self._flush_and_nudge_paste()
                         except OSError:
                             pass
                         self.idle_handled = False  # resume auto-approvals
@@ -2253,6 +2256,23 @@ class Supervisor:
             f"(to reply: ddll send {sender} <your message>)"
         )
 
+    def _flush_and_nudge_paste(self):
+        """After writing a message to the PTY, check if Claude Code collapsed it
+        into '[pasted text]' and send an extra Enter if so."""
+        time.sleep(0.3)
+        try:
+            r, _, _ = select.select([self.master_fd], [], [], 0.5)
+            if r:
+                data = os.read(self.master_fd, 16384)
+                os.write(sys.stdout.fileno(), data)  # passthrough
+                self._buffer_output(strip_ansi(data.decode('utf-8', errors='replace')))
+                if 'pasted text' in data.decode('utf-8', errors='replace').lower():
+                    # Claude collapsed the paste — send Enter to submit
+                    time.sleep(0.1)
+                    os.write(self.master_fd, b'\r')
+        except Exception:
+            pass
+
     def _intervene(self, trigger: str, action: str = 'message',
                    message: str = '', reasoning: str = '', status: str = ''):
         """Level 3: actually send messages / interrupts to the agent.
@@ -2310,6 +2330,7 @@ class Supervisor:
             try:
                 formatted = self._format_agent_message(message)
                 os.write(self.master_fd, (formatted + '\r').encode())
+                self._flush_and_nudge_paste()
             except OSError:
                 pass
             self._notify(
@@ -2324,6 +2345,7 @@ class Supervisor:
             try:
                 formatted = self._format_agent_message(message)
                 os.write(self.master_fd, (formatted + '\r').encode())
+                self._flush_and_nudge_paste()
             except OSError:
                 pass
 
