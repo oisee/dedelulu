@@ -220,21 +220,7 @@ def ask_llm_prompt(context: str, provider: str = 'anthropic',
               f"\nPROGRAM OUTPUT (last 30 lines):\n{context}\n\nYOUR INPUT:")
 
     try:
-        if provider == 'claude-cli':
-            return _ask_claude_cli(prompt, model)
-        elif provider == 'anthropic':
-            return _ask_anthropic(prompt, model or 'claude-haiku-4-5-20251001',
-                                  api_key or os.getenv('ANTHROPIC_API_KEY'))
-        elif provider == 'ollama':
-            return _ask_ollama(prompt, model or 'ministral-3:8b')
-        elif provider == 'openai':
-            return _ask_openai(prompt, model or 'gpt-4o-mini',
-                               api_key or os.getenv('OPENAI_API_KEY'))
-        elif provider == 'azure':
-            return _ask_azure(prompt, model or 'gpt-4o',
-                              api_key or os.getenv('AZURE_OPENAI_API_KEY'))
-        else:
-            return None
+        return _ask_llm(prompt, provider, model, api_key or '')
     except Exception as e:
         log_event('llm_error', {'error': str(e), 'provider': provider})
         return None
@@ -322,21 +308,7 @@ RULES:
 JSON:"""
 
     try:
-        if provider == 'claude-cli':
-            raw = _ask_claude_cli(prompt, model)
-        elif provider == 'anthropic':
-            raw = _ask_anthropic(prompt, model or 'claude-haiku-4-5-20251001',
-                                 api_key or os.getenv('ANTHROPIC_API_KEY'))
-        elif provider == 'ollama':
-            raw = _ask_ollama(prompt, model or 'ministral-3:8b')
-        elif provider == 'openai':
-            raw = _ask_openai(prompt, model or 'gpt-4o-mini',
-                              api_key or os.getenv('OPENAI_API_KEY'))
-        elif provider == 'azure':
-            raw = _ask_azure(prompt, model or 'gpt-4o-mini',
-                             api_key or os.getenv('AZURE_OPENAI_API_KEY'))
-        else:
-            return None
+        raw = _ask_llm(prompt, provider, model, api_key or '')
 
         if not raw:
             return None
@@ -361,7 +333,8 @@ JSON:"""
         return None
 
 
-def _ask_anthropic(prompt: str, model: str, api_key: str) -> Optional[str]:
+def _ask_anthropic(messages: list, model: str, api_key: str,
+                    max_tokens: int = 200, **_kw) -> Optional[str]:
     if not api_key:
         return None
     try:
@@ -369,9 +342,9 @@ def _ask_anthropic(prompt: str, model: str, api_key: str) -> Optional[str]:
         client = anthropic.Anthropic(api_key=api_key)
         resp = client.messages.create(
             model=model,
-            max_tokens=200,
+            max_tokens=max_tokens,
             temperature=0.0,
-            messages=[{'role': 'user', 'content': prompt}]
+            messages=messages
         )
         return resp.content[0].text.strip()
     except ImportError:
@@ -379,9 +352,9 @@ def _ask_anthropic(prompt: str, model: str, api_key: str) -> Optional[str]:
         import urllib.request
         data = json.dumps({
             'model': model,
-            'max_tokens': 200,
+            'max_tokens': max_tokens,
             'temperature': 0.0,
-            'messages': [{'role': 'user', 'content': prompt}]
+            'messages': messages
         }).encode()
         req = urllib.request.Request(
             'https://api.anthropic.com/v1/messages',
@@ -392,14 +365,24 @@ def _ask_anthropic(prompt: str, model: str, api_key: str) -> Optional[str]:
                 'anthropic-version': '2023-06-01'
             }
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             body = json.loads(resp.read())
             return body['content'][0]['text'].strip()
 
 
-def _ask_claude_cli(prompt: str, model: str = None) -> Optional[str]:
+def _ask_claude_cli(messages: list, model: str = None,
+                     max_tokens: int = 200, **_kw) -> Optional[str]:
     """Use 'claude -p' (Claude Code CLI) as the LLM. No API key needed — uses Max subscription."""
     import subprocess
+    # Concatenate messages into a single prompt for CLI
+    if len(messages) == 1:
+        prompt = messages[0]['content']
+    else:
+        parts = []
+        for m in messages:
+            role = 'User' if m['role'] == 'user' else 'Assistant'
+            parts.append(f"{role}: {m['content']}")
+        prompt = '\n\n'.join(parts)
     cmd = ['claude', '-p', prompt]
     if model:
         cmd.extend(['--model', model])
@@ -409,7 +392,7 @@ def _ask_claude_cli(prompt: str, model: str = None) -> Optional[str]:
     env.pop('CLAUDE_CODE', None)
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30, env=env
+            cmd, capture_output=True, text=True, timeout=120, env=env
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
@@ -434,42 +417,46 @@ def _normalize_ollama_host(host: str) -> str:
     return host
 
 
-def _ask_ollama(prompt: str, model: str) -> Optional[str]:
+def _ask_ollama(messages: list, model: str,
+                 max_tokens: int = 300, **_kw) -> Optional[str]:
     import urllib.request
     host = _normalize_ollama_host(os.getenv('OLLAMA_HOST', ''))
-    # Suppress thinking for qwen3 models — append /no_think
-    effective_prompt = prompt
-    if 'qwen3' in model.lower():
-        effective_prompt = prompt + ' /no_think'
+    # Suppress thinking for qwen3 models — append /no_think to last user message
+    effective_messages = list(messages)
+    if 'qwen3' in model.lower() and effective_messages:
+        last = effective_messages[-1]
+        if last['role'] == 'user':
+            effective_messages[-1] = {**last, 'content': last['content'] + ' /no_think'}
     data = json.dumps({
         'model': model,
-        'prompt': effective_prompt,
+        'messages': effective_messages,
         'stream': False,
-        'options': {'temperature': 0.0, 'num_predict': 300}
+        'options': {'temperature': 0.0, 'num_predict': max_tokens}
     }).encode()
     req = urllib.request.Request(
-        f'{host}/api/generate',
+        f'{host}/api/chat',
         data=data,
         headers={'Content-Type': 'application/json'}
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
         body = json.loads(resp.read())
-        result = body.get('response', '').strip()
+        result = body.get('message', {}).get('content', '').strip()
         # Strip thinking tags from reasoning models
         if '<think>' in result:
             result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL).strip()
         return result or None
 
 
-def _ask_openai(prompt: str, model: str, api_key: str) -> Optional[str]:
+def _ask_openai(messages: list, model: str, api_key: str,
+                 max_tokens: int = 200, **_kw) -> Optional[str]:
     if not api_key:
         return None
     import urllib.request
     data = json.dumps({
         'model': model,
-        'messages': [{'role': 'user', 'content': prompt}],
+        'messages': messages,
         'temperature': 0.0,
-        'max_tokens': 200
+        'max_tokens': max_tokens
     }).encode()
     req = urllib.request.Request(
         'https://api.openai.com/v1/chat/completions',
@@ -479,15 +466,18 @@ def _ask_openai(prompt: str, model: str, api_key: str) -> Optional[str]:
             'Authorization': f'Bearer {api_key}'
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:
         body = json.loads(resp.read())
         return body['choices'][0]['message']['content'].strip()
 
 
-def _ask_azure(prompt: str, model: str, api_key: str) -> Optional[str]:
+def _ask_azure(messages: list, model: str, api_key: str,
+                max_tokens: int = 300, endpoint: str = '',
+                api_version: str = '', deployment: str = '',
+                **_kw) -> Optional[str]:
     """Azure OpenAI API.
 
-    Env vars:
+    Env vars (used as fallbacks when params not provided):
         AZURE_OPENAI_API_KEY    — API key
         AZURE_OPENAI_ENDPOINT   — e.g. https://myinstance.openai.azure.com
         AZURE_OPENAI_API_VERSION — e.g. 2024-12-01-preview (default)
@@ -496,19 +486,19 @@ def _ask_azure(prompt: str, model: str, api_key: str) -> Optional[str]:
     if not api_key:
         return None
     import urllib.request
-    endpoint = os.getenv('AZURE_OPENAI_ENDPOINT', '').rstrip('/')
+    endpoint = (endpoint or os.getenv('AZURE_OPENAI_ENDPOINT', '')).rstrip('/')
     if not endpoint:
         log_event('azure_error', {'error': 'AZURE_OPENAI_ENDPOINT not set'})
         return None
-    api_version = os.getenv('AZURE_OPENAI_API_VERSION', '2024-12-01-preview')
-    deployment = os.getenv('AZURE_OPENAI_DEPLOYMENT', model)
+    api_version = api_version or os.getenv('AZURE_OPENAI_API_VERSION', '2024-12-01-preview')
+    deployment = deployment or os.getenv('AZURE_OPENAI_DEPLOYMENT', model)
 
     url = f'{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}'
     # Reasoning models (o-series) don't support temperature, use max_completion_tokens
     is_reasoning = deployment.startswith('o')
     payload = {
-        'messages': [{'role': 'user', 'content': prompt}],
-        'max_completion_tokens': 300,
+        'messages': messages,
+        'max_completion_tokens': max_tokens,
     }
     if not is_reasoning:
         payload['temperature'] = 0.0
@@ -521,9 +511,42 @@ def _ask_azure(prompt: str, model: str, api_key: str) -> Optional[str]:
             'api-key': api_key
         }
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         body = json.loads(resp.read())
         return body['choices'][0]['message']['content'].strip()
+
+
+def _ask_llm_messages(messages: list, provider: str, model: str,
+                       api_key: str = '', max_tokens: int = 4096,
+                       **kwargs) -> Optional[str]:
+    """Multi-turn LLM call dispatcher. All _ask_* functions accept messages arrays."""
+    if provider == 'claude-cli':
+        return _ask_claude_cli(messages, model, max_tokens=max_tokens)
+    elif provider == 'anthropic':
+        return _ask_anthropic(messages, model or 'claude-haiku-4-5-20251001',
+                              api_key or os.getenv('ANTHROPIC_API_KEY', ''),
+                              max_tokens=max_tokens)
+    elif provider == 'ollama':
+        return _ask_ollama(messages, model or 'ministral-3:8b',
+                           max_tokens=max_tokens)
+    elif provider == 'openai':
+        return _ask_openai(messages, model or 'gpt-4o-mini',
+                           api_key or os.getenv('OPENAI_API_KEY', ''),
+                           max_tokens=max_tokens)
+    elif provider == 'azure':
+        return _ask_azure(messages, model or 'gpt-4o',
+                          api_key or os.getenv('AZURE_OPENAI_API_KEY', ''),
+                          max_tokens=max_tokens, **kwargs)
+    return None
+
+
+def _ask_llm(prompt: str, provider: str, model: str,
+              api_key: str = '', max_tokens: int = 200,
+              **kwargs) -> Optional[str]:
+    """Single-prompt convenience wrapper for supervisor use."""
+    messages = [{'role': 'user', 'content': prompt}]
+    return _ask_llm_messages(messages, provider, model, api_key,
+                              max_tokens=max_tokens, **kwargs)
 
 
 # =============================================================================
@@ -652,6 +675,214 @@ class IPC:
 
 
 # =============================================================================
+# LLM Endpoints — discover and talk to configured LLM instances
+# =============================================================================
+
+@dataclass
+class LLMEndpoint:
+    """A configured LLM endpoint that can be addressed by name."""
+    name: str          # short name, e.g. "gpt54", "qwen3-4b"
+    provider: str      # azure|openai|ollama|anthropic|claude-cli|google
+    model: str         # deployment/model name
+    api_key: str = ''
+    endpoint: str = ''     # for azure: base URL
+    api_version: str = ''  # for azure
+    deployment: str = ''   # for azure: deployment name
+
+
+class LLMRegistry:
+    """Discovers configured LLM endpoints from env vars and Ollama."""
+
+    @classmethod
+    def discover(cls) -> list:
+        """Scan DDLL_LLM_* env vars + Ollama whitelist. Returns list of LLMEndpoint."""
+        endpoints = {}
+
+        # Built-in default: gpt54 → Azure OpenAI GPT-5.4
+        endpoints['gpt54'] = LLMEndpoint(
+            name='gpt54',
+            provider='azure',
+            model='gpt-5.4',
+            api_key=os.getenv('AZURE_OPENAI_API_KEY', ''),
+            endpoint=os.getenv('AZURE_OPENAI_ENDPOINT', ''),
+            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-12-01-preview'),
+            deployment=os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-5.4'),
+        )
+
+        # Scan DDLL_LLM_<NAME>_PROVIDER env vars
+        prefix = 'DDLL_LLM_'
+        seen_names = set()
+        for key in os.environ:
+            if key.startswith(prefix) and key.endswith('_PROVIDER'):
+                name = key[len(prefix):-len('_PROVIDER')].lower()
+                seen_names.add(name)
+        for name in seen_names:
+            NAME = name.upper()
+            provider = os.getenv(f'DDLL_LLM_{NAME}_PROVIDER', '')
+            model = os.getenv(f'DDLL_LLM_{NAME}_MODEL', '')
+            api_key = os.getenv(f'DDLL_LLM_{NAME}_API_KEY', '')
+            ep_url = os.getenv(f'DDLL_LLM_{NAME}_ENDPOINT', '')
+            av = os.getenv(f'DDLL_LLM_{NAME}_API_VERSION', '')
+            dep = os.getenv(f'DDLL_LLM_{NAME}_DEPLOYMENT', '')
+            # Fall back to provider-level defaults for api_key
+            if not api_key:
+                if provider == 'azure':
+                    api_key = os.getenv('AZURE_OPENAI_API_KEY', '')
+                elif provider == 'openai':
+                    api_key = os.getenv('OPENAI_API_KEY', '')
+                elif provider == 'anthropic':
+                    api_key = os.getenv('ANTHROPIC_API_KEY', '')
+            if not ep_url and provider == 'azure':
+                ep_url = os.getenv('AZURE_OPENAI_ENDPOINT', '')
+            endpoints[name] = LLMEndpoint(
+                name=name, provider=provider, model=model,
+                api_key=api_key, endpoint=ep_url,
+                api_version=av or os.getenv('AZURE_OPENAI_API_VERSION', '2024-12-01-preview'),
+                deployment=dep or model,
+            )
+
+        # Ollama auto-discovery (whitelisted models only)
+        whitelist = os.getenv('DDLL_OLLAMA_WHITELIST', '')
+        if whitelist:
+            allowed = {m.strip() for m in whitelist.split(',') if m.strip()}
+            try:
+                import urllib.request
+                host = _normalize_ollama_host(os.getenv('OLLAMA_HOST', ''))
+                req = urllib.request.Request(f'{host}/api/tags')
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    body = json.loads(resp.read())
+                for m in body.get('models', []):
+                    model_name = m.get('name', '')
+                    if model_name in allowed:
+                        short = model_name.replace(':', '-')
+                        if short not in endpoints:
+                            endpoints[short] = LLMEndpoint(
+                                name=short, provider='ollama', model=model_name,
+                            )
+            except Exception:
+                pass  # Ollama not available, skip
+
+        return list(endpoints.values())
+
+    @classmethod
+    def find(cls, name: str) -> Optional[LLMEndpoint]:
+        """Find a single LLM endpoint by name (case-insensitive)."""
+        name_lower = name.lower()
+        for ep in cls.discover():
+            if ep.name == name_lower:
+                return ep
+        return None
+
+
+class LLMSession:
+    """Persistent conversation session with an LLM."""
+
+    SESSION_DIR = os.path.join(tempfile.gettempdir(), 'dedelulu_llm_sessions')
+
+    def __init__(self, llm_name: str, session_name: str):
+        self.llm_name = llm_name
+        self.session_name = session_name
+        self.path = os.path.join(self.SESSION_DIR,
+                                 f'{llm_name}_{session_name}.json')
+        self.messages: list = []
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path) as f:
+                    data = json.load(f)
+                self.messages = data.get('messages', [])
+            except (json.JSONDecodeError, OSError):
+                self.messages = []
+
+    def add_user(self, content: str):
+        self.messages.append({'role': 'user', 'content': content})
+
+    def add_assistant(self, content: str):
+        self.messages.append({'role': 'assistant', 'content': content})
+        self._save()
+
+    def _save(self):
+        os.makedirs(self.SESSION_DIR, exist_ok=True)
+        with open(self.path, 'w') as f:
+            json.dump({
+                'llm': self.llm_name,
+                'session': self.session_name,
+                'messages': self.messages,
+                'updated': datetime.now().isoformat()
+            }, f, indent=2)
+
+
+# Non-binary file extensions for file injection
+_TEXT_EXTENSIONS = {
+    '.md', '.py', '.go', '.js', '.ts', '.tsx', '.jsx', '.txt', '.json',
+    '.yaml', '.yml', '.toml', '.cfg', '.ini', '.sh', '.bash', '.zsh',
+    '.html', '.css', '.sql', '.rs', '.c', '.h', '.cpp', '.hpp', '.java',
+    '.rb', '.php', '.swift', '.kt', '.scala', '.r', '.csv', '.xml',
+    '.env', '.dockerfile', '.makefile', '.gitignore', '.log', '.conf',
+    '.asm', '.s', '.inc', '.ld', '.cmake', '.proto', '.graphql',
+}
+_TEXT_BASENAMES = {'makefile', 'dockerfile', '.gitignore', '.env', 'readme',
+                   'changelog', 'license', 'todo'}
+
+
+def _read_context_files(paths: list) -> str:
+    """Read non-binary files and format as context blocks."""
+    blocks = []
+    for path in paths:
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path):
+            path = os.path.abspath(path)
+        ext = os.path.splitext(path)[1].lower()
+        basename = os.path.basename(path).lower()
+        if ext not in _TEXT_EXTENSIONS and basename not in _TEXT_BASENAMES:
+            blocks.append(f"[skipped unsupported file type: {path}]")
+            continue
+        try:
+            with open(path) as f:
+                content = f.read(512 * 1024)  # 512KB max per file
+            blocks.append(f"--- {path} ---\n{content}\n--- end {path} ---")
+        except Exception as e:
+            blocks.append(f"[error reading {path}: {e}]")
+    return '\n\n'.join(blocks)
+
+
+def _extract_inline_files(parts: list) -> tuple:
+    """Extract @file references from message parts. Returns (clean_parts, file_paths).
+
+    Handles @file as standalone tokens OR embedded in text:
+        ["summarize", "@README.md"]          → both forms work
+        ["summarize this @README.md please"] → scanned within text too
+    """
+    clean = []
+    files = []
+    # Regex: @followed-by-path-chars, not preceded by alphanumeric (e.g. email)
+    file_ref_re = re.compile(r'(?<![a-zA-Z0-9])@([\w./~_-][\w./~_-]*\.[\w]+)')
+    for part in parts:
+        found_in_part = []
+        for m in file_ref_re.finditer(part):
+            fpath = m.group(1)
+            expanded = os.path.expanduser(fpath)
+            if not os.path.isabs(expanded):
+                expanded = os.path.abspath(expanded)
+            if os.path.isfile(expanded):
+                found_in_part.append((m.start(), m.end(), expanded))
+        if found_in_part:
+            # Remove matched @refs from the text, keep the rest
+            remaining = part
+            for start, end, fpath in reversed(found_in_part):
+                remaining = remaining[:start] + remaining[end:]
+                files.append(fpath)
+            remaining = remaining.strip()
+            if remaining:
+                clean.append(remaining)
+        else:
+            clean.append(part)
+    return clean, files
+
+
+# =============================================================================
 # Registry — discover all dedelulu instances on this machine
 # =============================================================================
 
@@ -714,12 +945,24 @@ class Registry:
           - "worker_name" — matches by name (prefer same session if set)
           - "session_id:worker_name" — exact match
           - "all" — all live workers
+          - LLM endpoint name (e.g. "gpt54") — returns virtual LLM target
         """
         all_workers = cls.discover()
         live = [w for w in all_workers if w['alive']]
 
         if target == 'all':
             return live
+
+        # Check if target is an LLM endpoint (before worker matching)
+        llm = LLMRegistry.find(target)
+        if llm:
+            return [{
+                'type': 'llm',
+                'llm_endpoint': llm,
+                'worker_name': llm.name,
+                'session_id': 'llm',
+                'alive': True,
+            }]
 
         # session_id:worker_name format
         if ':' in target:
@@ -2112,21 +2355,8 @@ RULES:
 - Reply with ONLY the message text (no quotes, no explanation). Or SKIP if done."""
 
         try:
-            if self.provider == 'claude-cli':
-                raw = _ask_claude_cli(prompt, self.model)
-            elif self.provider == 'anthropic':
-                raw = _ask_anthropic(prompt, self.model or 'claude-haiku-4-5-20251001',
-                                     self.api_key or os.getenv('ANTHROPIC_API_KEY'))
-            elif self.provider == 'ollama':
-                raw = _ask_ollama(prompt, self.model or 'ministral-3:8b')
-            elif self.provider == 'openai':
-                raw = _ask_openai(prompt, self.model or 'gpt-4o-mini',
-                                  self.api_key or os.getenv('OPENAI_API_KEY'))
-            elif self.provider == 'azure':
-                raw = _ask_azure(prompt, self.model or 'gpt-4o-mini',
-                                 self.api_key or os.getenv('AZURE_OPENAI_API_KEY'))
-            else:
-                raw = None
+            raw = _ask_llm(prompt, self.provider, self.model,
+                           self.api_key or '')
         except Exception as e:
             log_event('stale_nudge_error', {'error': str(e)})
             raw = None
@@ -2327,6 +2557,10 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == 'send':
         sys.argv = [sys.argv[0]] + sys.argv[2:]  # strip 'send' so send_main sees target+msg
         send_main()
+        sys.exit(0)
+    if len(sys.argv) >= 2 and sys.argv[1] == 'ask':
+        sys.argv = [sys.argv[0]] + sys.argv[2:]  # strip 'ask' so ask_main sees llm+question
+        ask_main()
         sys.exit(0)
     # Foreman mode: dedelulu --foreman <ipc_dir>
     if len(sys.argv) >= 3 and sys.argv[1] == '--foreman':
@@ -2610,7 +2844,7 @@ with system instructions (put dedelulu flags BEFORE the command):
 
 
 def explore_main():
-    """Entry point for dedelulu explore: list all live dedelulu instances.
+    """Entry point for dedelulu explore: list all live dedelulu instances + LLM endpoints.
 
     Usage: dedelulu explore [--json]
     """
@@ -2618,33 +2852,54 @@ def explore_main():
 
     workers = Registry.discover()
     live = [w for w in workers if w['alive']]
+    llm_endpoints = LLMRegistry.discover()
 
-    if not live:
+    if not live and not llm_endpoints:
         if use_json:
-            print('[]')
+            print(json.dumps({'workers': [], 'llm_endpoints': []}, indent=2))
         else:
-            print("no live dedelulu instances found")
+            print("no live dedelulu instances or LLM endpoints found")
         sys.exit(0)
 
     if use_json:
-        print(json.dumps(live, indent=2))
+        llm_data = [{'name': e.name, 'provider': e.provider, 'model': e.model,
+                      'type': 'llm', 'has_key': bool(e.api_key) or e.provider == 'ollama'}
+                     for e in llm_endpoints]
+        print(json.dumps({'workers': live, 'llm_endpoints': llm_data}, indent=2))
         sys.exit(0)
 
-    # Table output
-    fmt = '{:<12} {:<12} {:<8} {:<30} {}'
-    print(fmt.format('SESSION', 'WORKER', 'PID', 'DIR', 'TASK'))
-    print(fmt.format('─' * 12, '─' * 12, '─' * 8, '─' * 30, '─' * 30))
-    for w in live:
-        sid = w['session_id'][:12]
-        directory = w['directory']
-        # Shorten home dir
-        home = os.path.expanduser('~')
-        if directory.startswith(home):
-            directory = '~' + directory[len(home):]
-        print(fmt.format(
-            sid, w['worker_name'], str(w['pid'] or '?'),
-            directory[:30], w['task'][:50],
-        ))
+    # Workers table
+    if live:
+        fmt = '{:<12} {:<12} {:<8} {:<8} {:<30} {}'
+        print(fmt.format('SESSION', 'WORKER', 'TYPE', 'PID', 'DIR', 'TASK'))
+        print(fmt.format('─' * 12, '─' * 12, '─' * 8, '─' * 8, '─' * 30, '─' * 30))
+        for w in live:
+            sid = w['session_id'][:12]
+            directory = w['directory']
+            home = os.path.expanduser('~')
+            if directory.startswith(home):
+                directory = '~' + directory[len(home):]
+            wtype = 'claude' if 'claude' in w.get('task', '').lower() else 'local'
+            print(fmt.format(
+                sid, w['worker_name'], wtype, str(w['pid'] or '?'),
+                directory[:30], w['task'][:50],
+            ))
+
+    # LLM endpoints table
+    if llm_endpoints:
+        if live:
+            print()
+        fmt_llm = '{:<12} {:<12} {:<20} {}'
+        print(fmt_llm.format('LLM', 'PROVIDER', 'MODEL', 'STATUS'))
+        print(fmt_llm.format('─' * 12, '─' * 12, '─' * 20, '─' * 20))
+        for ep in llm_endpoints:
+            if ep.provider == 'ollama':
+                status = 'ready'
+            elif ep.api_key:
+                status = 'ready'
+            else:
+                status = 'no api key'
+            print(fmt_llm.format(ep.name, ep.provider, ep.model[:20], status))
 
 
 def send_main():
@@ -2695,9 +2950,149 @@ def send_main():
             print(f"  {w['session_id'][:8]}:{w['worker_name']}", file=sys.stderr)
 
     for w in matches:
+        if w.get('type') == 'llm':
+            # Synchronous LLM call
+            endpoint = w['llm_endpoint']
+            # Support @file inline refs in the message
+            parts = message.split()
+            clean_parts, inline_files = _extract_inline_files(parts)
+            effective_msg = ' '.join(clean_parts)
+            if inline_files:
+                file_ctx = _read_context_files(inline_files)
+                effective_msg = f"{file_ctx}\n\n{effective_msg}"
+
+            # Persistent session by default — keyed by sender identity
+            session = LLMSession(endpoint.name, sender)
+            session.add_user(effective_msg)
+            llm_messages = session.messages
+            try:
+                response = _ask_llm_messages(
+                    llm_messages, endpoint.provider, endpoint.model,
+                    endpoint.api_key,
+                    endpoint=endpoint.endpoint,
+                    api_version=endpoint.api_version,
+                    deployment=endpoint.deployment,
+                )
+            except Exception as e:
+                print(f"error: {endpoint.name}: {e}", file=sys.stderr)
+                continue
+
+            if not response:
+                print(f"error: {endpoint.name} returned no response",
+                      file=sys.stderr)
+                continue
+
+            session.add_assistant(response)
+
+            # Route response back to sender via IPC if they're a dedelulu worker
+            if prefer_session:
+                sender_matches = Registry.find_target(
+                    worker_name, prefer_session=prefer_session)
+                sender_matches = [m for m in sender_matches
+                                  if m.get('type') != 'llm']
+                if sender_matches:
+                    sender_ipc = IPC(sender_matches[0]['ipc_dir'])
+                    sender_ipc.send_input(response, sender=endpoint.name)
+                    print(f"[{endpoint.name}] responded "
+                          f"({len(response)} chars) → {sender}")
+                    continue
+            # No IPC route — print to stdout
+            print(f"[{endpoint.name}]: {response}")
+            continue
+
         ipc = IPC(w['ipc_dir'])
         ipc.send_input(message, sender=sender)
         print(f"sent to [{w['session_id'][:8]}:{w['worker_name']}]")
+
+
+def ask_main():
+    """Entry point for ddll ask: query an LLM endpoint.
+
+    Usage:
+        ddll ask <llm> [options] <question>
+        ddll ask gpt54 "what is 2+2"
+        ddll ask gpt54 -s debug "why is my parser broken?"
+        ddll ask gpt54 --file code.py "explain this"
+        ddll ask gpt54 review @README.md          (inline file injection)
+    """
+    parser = argparse.ArgumentParser(
+        prog='ddll ask',
+        description='Query an LLM endpoint',
+    )
+    parser.add_argument('llm', help='LLM endpoint name (e.g. gpt54, qwen3-4b)')
+    parser.add_argument('question', nargs='*', default=[],
+                        help='question to ask (supports @file inline refs)')
+    parser.add_argument('-s', '--session', default=None,
+                        help='session name for conversation persistence')
+    parser.add_argument('-f', '--file', action='append', default=[],
+                        dest='files', help='file(s) to include as context')
+    parser.add_argument('--max-tokens', type=int, default=4096,
+                        help='max response tokens (default: 4096)')
+
+    args = parser.parse_args()
+
+    # Resolve LLM endpoint
+    endpoint = LLMRegistry.find(args.llm)
+    if not endpoint:
+        available = [e.name for e in LLMRegistry.discover()]
+        print(f"error: unknown LLM '{args.llm}' "
+              f"(available: {', '.join(available) or 'none configured'})",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not args.question:
+        # Read from stdin if no question provided
+        if not sys.stdin.isatty():
+            question = sys.stdin.read().strip()
+        else:
+            print("error: no question provided", file=sys.stderr)
+            sys.exit(1)
+        all_files = list(args.files)
+    else:
+        # Extract @file inline references from question parts
+        clean_parts, inline_files = _extract_inline_files(args.question)
+        question = ' '.join(clean_parts)
+        all_files = list(args.files) + inline_files
+
+    # File injection — prepend file contents to the question
+    if all_files:
+        file_context = _read_context_files(all_files)
+        question = f"{file_context}\n\n{question}"
+
+    # Session management
+    if args.session:
+        session = LLMSession(args.llm, args.session)
+        session.add_user(question)
+        messages = session.messages
+    else:
+        messages = [{'role': 'user', 'content': question}]
+
+    # Call LLM
+    try:
+        response = _ask_llm_messages(
+            messages, endpoint.provider, endpoint.model, endpoint.api_key,
+            max_tokens=args.max_tokens,
+            endpoint=endpoint.endpoint, api_version=endpoint.api_version,
+            deployment=endpoint.deployment,
+        )
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if response is None:
+        print("error: LLM returned no response", file=sys.stderr)
+        sys.exit(1)
+
+    # Save to session if persistent
+    if args.session:
+        session.add_assistant(response)
+        print(f"[{args.llm}:{args.session}] ", end='', file=sys.stderr)
+        print(f"(log: {session.path})", file=sys.stderr)
+    else:
+        print(f"[{args.llm}] ", end='', file=sys.stderr)
+        print(file=sys.stderr)
+
+    print(response)
 
 
 if __name__ == '__main__':

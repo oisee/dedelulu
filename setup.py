@@ -33,6 +33,7 @@ setup(
             'ddll=dedelulu:main',
             'dedelulu-send=dedelulu:send_main',
             'dedelulu-explore=dedelulu:explore_main',
+            'dedelulu-ask=dedelulu:ask_main',
         ],
     },
 )
