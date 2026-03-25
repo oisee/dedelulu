@@ -516,6 +516,41 @@ def _ask_azure(messages: list, model: str, api_key: str,
         return body['choices'][0]['message']['content'].strip()
 
 
+def _ask_gemini(messages: list, model: str, api_key: str,
+                 max_tokens: int = 4096, **_kw) -> Optional[str]:
+    """Google Gemini API (generativelanguage.googleapis.com)."""
+    if not api_key:
+        return None
+    import urllib.request
+    # Convert OpenAI-style messages to Gemini contents format
+    contents = []
+    for m in messages:
+        role = 'user' if m['role'] == 'user' else 'model'
+        contents.append({'role': role, 'parts': [{'text': m['content']}]})
+    payload = {
+        'contents': contents,
+        'generationConfig': {
+            'maxOutputTokens': max_tokens,
+            'temperature': 0.0,
+        }
+    }
+    data = json.dumps(payload).encode()
+    url = (f'https://generativelanguage.googleapis.com/v1beta/models/'
+           f'{model}:generateContent?key={api_key}')
+    req = urllib.request.Request(
+        url, data=data,
+        headers={'Content-Type': 'application/json'}
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = json.loads(resp.read())
+        candidates = body.get('candidates', [])
+        if candidates:
+            parts = candidates[0].get('content', {}).get('parts', [])
+            if parts:
+                return parts[0].get('text', '').strip()
+        return None
+
+
 def _ask_llm_messages(messages: list, provider: str, model: str,
                        api_key: str = '', max_tokens: int = 4096,
                        **kwargs) -> Optional[str]:
@@ -537,6 +572,10 @@ def _ask_llm_messages(messages: list, provider: str, model: str,
         return _ask_azure(messages, model or 'gpt-4o',
                           api_key or os.getenv('AZURE_OPENAI_API_KEY', ''),
                           max_tokens=max_tokens, **kwargs)
+    elif provider in ('google', 'gemini'):
+        return _ask_gemini(messages, model or 'gemini-2.5-flash',
+                           api_key or os.getenv('GEMINI_API_KEY', ''),
+                           max_tokens=max_tokens)
     return None
 
 
@@ -709,6 +748,16 @@ class LLMRegistry:
             deployment=os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-5.4'),
         )
 
+        # Built-in: gemini → Google Gemini 2.5 Flash
+        gemini_key = os.getenv('GEMINI_API_KEY', '')
+        if gemini_key:
+            endpoints['gemini'] = LLMEndpoint(
+                name='gemini',
+                provider='google',
+                model='gemini-2.5-flash',
+                api_key=gemini_key,
+            )
+
         # Scan DDLL_LLM_<NAME>_PROVIDER env vars
         prefix = 'DDLL_LLM_'
         seen_names = set()
@@ -732,6 +781,8 @@ class LLMRegistry:
                     api_key = os.getenv('OPENAI_API_KEY', '')
                 elif provider == 'anthropic':
                     api_key = os.getenv('ANTHROPIC_API_KEY', '')
+                elif provider in ('google', 'gemini'):
+                    api_key = os.getenv('GEMINI_API_KEY', '')
             if not ep_url and provider == 'azure':
                 ep_url = os.getenv('AZURE_OPENAI_ENDPOINT', '')
             endpoints[name] = LLMEndpoint(
