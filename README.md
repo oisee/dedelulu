@@ -21,6 +21,9 @@ dedelulu claude "add tests for the auth module"
 # With supervisor — watches for derailing
 dedelulu --provider azure claude "add tests for the auth module"
 
+# Talk to external LLMs
+ddll ask gpt54 "review @src/auth.py for security issues"
+
 # Multi-worker — two agents collaborating
 dedelulu-multi \
   --worker "api:.:implement CRUD endpoints" \
@@ -267,6 +270,150 @@ cd ~/dev/dedelulu
 - Rail detection: pauses if too many responses/minute or repeated prompts
 - You can always type into the terminal yourself — dedelulu backs off
 - Hooks are auto-removed on exit (original settings restored)
+
+## LLM Conversations: `ddll ask` and `ddll send`
+
+Talk to external LLMs (GPT-5.4, Ollama models, etc.) directly from the terminal
+or from within any dedelulu-managed agent. Conversations can be ephemeral or
+persistent, and files can be injected as context.
+
+### Quick examples
+
+```bash
+# One-off question
+ddll ask gpt54 "what's the best way to structure a Z80 parser?"
+
+# Persistent session — LLM remembers context across messages
+ddll ask gpt54 -s review "my name is Alice, I'm reviewing auth code"
+ddll ask gpt54 -s review "what should I look for in JWT validation?"
+
+# File injection — inline @file refs or --file flag
+ddll ask gpt54 "explain this @README.md"
+ddll ask gpt54 "find bugs in @src/parser.go and @src/lexer.go"
+ddll ask gpt54 --file src/auth.py "review this for security issues"
+
+# Pipe from stdin
+git diff | ddll ask gpt54 "review this diff"
+
+# From another agent via messaging fabric
+ddll send gpt54 "is this the right approach for error handling?"
+```
+
+### How it works
+
+```
+ddll ask gpt54 -s review "review @auth.py for security"
+  │
+  ├── LLMRegistry resolves "gpt54" → Azure OpenAI GPT-5.4
+  ├── @auth.py extracted, file contents injected as context
+  ├── LLMSession loads prior messages (if -s given)
+  ├── API call with full conversation history
+  ├── Response printed to stdout
+  └── Session saved to /tmp/dedelulu_llm_sessions/gpt54_review.json
+
+ddll send gpt54 "question"
+  │
+  ├── Same LLM call, but session auto-keyed by sender identity
+  └── Response routed back to sender via IPC (appears as [from:gpt54])
+```
+
+### `ddll ask` options
+
+```
+ddll ask <llm> [options] <question>
+
+  <llm>               LLM endpoint name (e.g. gpt54, qwen3-4b)
+  <question>          Supports @file.ext inline refs anywhere in text
+  -s, --session NAME  Persistent conversation (stored in /tmp/dedelulu_llm_sessions/)
+  -f, --file PATH     Include file as context (repeatable)
+  --max-tokens N      Max response tokens (default: 4096)
+```
+
+### `ddll send` to LLMs
+
+When `ddll send` targets an LLM instead of a worker, it:
+- Calls the LLM synchronously
+- Maintains a persistent session keyed by sender (e.g. `gpt54_fnm8yt76:main.json`)
+- Routes the response back to the sender via IPC
+
+This means agents can have ongoing conversations with LLMs through the
+same messaging fabric they use to talk to each other.
+
+### `ddll explore` — discover available LLMs
+
+```
+$ ddll explore
+
+SESSION      WORKER       TYPE     PID      DIR                            TASK
+──────────── ──────────── ──────── ──────── ────────────────────────────── ──────────────────────────────
+3fpxierq     main         claude   397759   ~/dev/minz-vir                 claude --resume
+fnm8yt76     main         claude   433055   ~/dev/dedelulu                 claude
+
+LLM          PROVIDER     MODEL                STATUS
+──────────── ──────────── ──────────────────── ────────────────────
+gpt54        azure        gpt-5.4              ready
+qwen3-4b     ollama       qwen3:4b             ready
+```
+
+### Configuring LLM endpoints
+
+**Built-in default**: `gpt54` maps to Azure OpenAI GPT-5.4
+(uses your existing `AZURE_OPENAI_*` env vars).
+
+**Custom endpoints** via `DDLL_LLM_<NAME>_*` env vars:
+
+```bash
+# Add a second Azure model
+export DDLL_LLM_O4MINI_PROVIDER=azure
+export DDLL_LLM_O4MINI_MODEL=o4-mini
+export DDLL_LLM_O4MINI_DEPLOYMENT=o4-mini
+
+# Add an Anthropic model
+export DDLL_LLM_HAIKU_PROVIDER=anthropic
+export DDLL_LLM_HAIKU_MODEL=claude-haiku-4-5-20251001
+
+# Add an OpenAI model
+export DDLL_LLM_GPT4_PROVIDER=openai
+export DDLL_LLM_GPT4_MODEL=gpt-4o
+```
+
+**Ollama auto-discovery** — whitelist models to auto-detect from a running Ollama server:
+
+```bash
+export DDLL_OLLAMA_WHITELIST=qwen3:4b,llama3:8b
+# These appear as "qwen3-4b" and "llama3-8b" in ddll explore/ask/send
+```
+
+### Real-world scenarios (observed)
+
+**Paper review workflow** — multiple agents independently used file injection
+to review research drafts, getting detailed multi-section feedback
+(novelty assessment, gap analysis, venue suggestions):
+```bash
+ddll ask gpt54 -s paper @docs/research_statement.md "review for publication"
+ddll ask gpt54 -s paper "find weaknesses in section 4"
+ddll ask gpt54 -s paper "suggest improvements for the abstract"
+```
+
+**Cross-agent consultation** — agents asking GPT-5.4 for a second opinion
+while working on their own tasks:
+```bash
+# From inside a dedelulu-managed Claude Code session:
+ddll send gpt54 "is this the right approach for error handling in @src/handler.go?"
+# Response arrives via IPC: [from:gpt54] Yes, but consider...
+```
+
+**Quick math/fact checking** — minz agent verified Z80 arithmetic via GPT-5.4
+during assembly optimization work:
+```bash
+ddll send gpt54 "what is 42+7 in Z80 assembly, using ADD A,immediate?"
+# [from:gpt54] ADD A, 7 — result in A = 49 (0x31)
+```
+
+**Multi-file code review** — injecting multiple files for holistic analysis:
+```bash
+ddll ask gpt54 "are these consistent? @src/types.go @src/handler.go @src/routes.go"
+```
 
 ## E2E Guide
 
