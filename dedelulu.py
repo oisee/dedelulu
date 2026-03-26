@@ -1155,6 +1155,7 @@ class NetworkBeacon:
             ('ddll-udp', self._udp_loop),
             ('ddll-tcp-listen', self._tcp_listen_loop),
             ('ddll-heartbeat', self._heartbeat_loop),
+            ('ddll-prober', self._prober_loop),
         ]
         for name, target in threads:
             t = threading.Thread(target=target, daemon=True, name=name)
@@ -1365,16 +1366,65 @@ class NetworkBeacon:
             for ip in dead:
                 _peer_remove(ip)
 
-            # Also send periodic UDP probe to find new peers
+            # UDP probing is handled by _prober_loop
+
+    # --- Active prober (ephemeral port — firewall-friendly) ---
+
+    def _prober_loop(self):
+        """Periodically send UDP probes from ephemeral port and process replies.
+
+        macOS firewall blocks unsolicited replies to bound ports (19547),
+        but allows replies to ephemeral ports. So we probe from a fresh
+        socket and read replies here, then trigger TCP connections.
+        """
+        local_ips = set(_get_local_ips())
+
+        while not self._stop.is_set():
             try:
-                probe_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                probe_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                probe_sock.settimeout(0.5)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.settimeout(2)
+                sock.bind(('', 0))  # ephemeral port
+
                 probe = _UDP_MAGIC + json.dumps({'type': 'discover'}).encode()
-                probe_sock.sendto(probe, (_BROADCAST_ADDR, DDLL_NET_PORT))
-                probe_sock.close()
+                sock.sendto(probe, (_BROADCAST_ADDR, DDLL_NET_PORT))
+
+                seen = set()
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sock.settimeout(remaining)
+                    try:
+                        data, addr = sock.recvfrom(65536)
+                    except socket.timeout:
+                        break
+                    if addr[0] in local_ips or addr[0] in seen:
+                        continue
+                    if not data.startswith(_UDP_MAGIC):
+                        continue
+                    try:
+                        msg = json.loads(data[len(_UDP_MAGIC):])
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if msg.get('type') != 'announce':
+                        continue
+                    seen.add(addr[0])
+                    host = msg.get('host', addr[0])
+                    ip = msg.get('ip', addr[0])
+                    port = msg.get('port', DDLL_NET_PORT)
+                    _peer_update(ip, host, port, msg.get('workers', []))
+                    # Open persistent TCP if not connected
+                    if not _peer_get_conn(ip):
+                        threading.Thread(target=self._connect_to_peer,
+                                         args=(ip, port), daemon=True).start()
+                sock.close()
             except Exception:
                 pass
+
+            # Wait before next probe cycle
+            self._stop.wait(_PEER_HEARTBEAT)
 
 
 # Singleton beacon
