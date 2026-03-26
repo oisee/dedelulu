@@ -934,21 +934,359 @@ def _extract_inline_files(parts: list) -> tuple:
 
 
 # =============================================================================
-# Registry — discover all dedelulu instances on this machine
+# Network — cross-host autodiscovery and message relay (LAN)
+# =============================================================================
+
+import socket
+import threading
+
+DDLL_NET_PORT = int(os.getenv('DDLL_NET_PORT', '19547'))
+_BROADCAST_ADDR = '<broadcast>'
+_UDP_MAGIC = b'DDLL'  # 4-byte prefix to filter stray packets
+
+
+def _get_hostname() -> str:
+    """Short hostname for display."""
+    return socket.gethostname().split('.')[0]
+
+
+def _get_local_ips() -> list[str]:
+    """Get all local non-loopback IPv4 addresses."""
+    ips = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith('127.'):
+                ips.append(ip)
+    except Exception:
+        pass
+    if not ips:
+        # Fallback: connect to broadcast to find default interface
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('192.168.255.255', 1))
+            ips.append(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+    return ips
+
+
+class NetworkBeacon:
+    """Background daemon that answers UDP discovery probes and relays TCP messages.
+
+    Protocol:
+        UDP broadcast (port DDLL_NET_PORT):
+            probe:   DDLL + JSON {"type": "discover"}
+            reply:   DDLL + JSON {"type": "announce", "host": "...", "ip": "...",
+                                   "port": 19547, "workers": [...]}
+
+        TCP (port DDLL_NET_PORT):
+            client sends: JSON line {"type": "send", "target": "...",
+                                      "message": "...", "sender": "..."}
+            server replies: JSON line {"ok": true} or {"ok": false, "error": "..."}
+    """
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._udp_thread = None
+        self._tcp_thread = None
+
+    def start(self):
+        """Start beacon threads (daemonic — dies with main process)."""
+        self._udp_thread = threading.Thread(target=self._udp_loop, daemon=True,
+                                             name='ddll-beacon-udp')
+        self._tcp_thread = threading.Thread(target=self._tcp_loop, daemon=True,
+                                             name='ddll-beacon-tcp')
+        self._udp_thread.start()
+        self._tcp_thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _local_workers_payload(self) -> list[dict]:
+        """Snapshot of local live workers for announcements."""
+        import glob as _glob
+        results = []
+        for session_dir in sorted(_glob.glob(
+                os.path.join(tempfile.gettempdir(), 'dedelulu_session_*'))):
+            session_file = os.path.join(session_dir, 'session.json')
+            if not os.path.isfile(session_file):
+                continue
+            try:
+                with open(session_file) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            session_id = os.path.basename(session_dir).replace('dedelulu_session_', '')
+            for wd in data.get('workers', []):
+                ipc_dir = wd.get('ipc_dir', '')
+                pid_path = os.path.join(ipc_dir, 'pid') if ipc_dir else ''
+                alive = False
+                if pid_path and os.path.isfile(pid_path):
+                    try:
+                        with open(pid_path) as f:
+                            pid = int(f.read().strip())
+                        os.kill(pid, 0)
+                        alive = True
+                    except (ValueError, ProcessLookupError, PermissionError, OSError):
+                        pass
+                if alive:
+                    results.append({
+                        'session_id': session_id,
+                        'worker_name': wd.get('name', '?'),
+                        'task': wd.get('task', ''),
+                        'directory': wd.get('directory', ''),
+                    })
+        return results
+
+    def _udp_loop(self):
+        """Listen for UDP discovery probes and reply with local workers."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        sock.settimeout(1.0)
+        try:
+            sock.bind(('', DDLL_NET_PORT))
+        except OSError:
+            return  # port in use — another beacon already running
+        local_ips = set(_get_local_ips())
+        hostname = _get_hostname()
+
+        while not self._stop.is_set():
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            # Ignore our own broadcasts
+            if addr[0] in local_ips:
+                continue
+            if not data.startswith(_UDP_MAGIC):
+                continue
+            try:
+                msg = json.loads(data[len(_UDP_MAGIC):])
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if msg.get('type') != 'discover':
+                continue
+            # Reply with our workers
+            workers = self._local_workers_payload()
+            reply = {
+                'type': 'announce',
+                'host': hostname,
+                'ip': _get_local_ips()[0] if _get_local_ips() else addr[0],
+                'port': DDLL_NET_PORT,
+                'workers': workers,
+            }
+            reply_data = _UDP_MAGIC + json.dumps(reply).encode()
+            try:
+                sock.sendto(reply_data, addr)
+            except OSError:
+                pass
+        sock.close()
+
+    def _tcp_loop(self):
+        """Listen for TCP message relay requests."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(1.0)
+        try:
+            sock.bind(('', DDLL_NET_PORT))
+        except OSError:
+            return  # port in use
+        sock.listen(8)
+
+        while not self._stop.is_set():
+            try:
+                conn, addr = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle_tcp, args=(conn,),
+                             daemon=True).start()
+        sock.close()
+
+    def _handle_tcp(self, conn: socket.socket):
+        """Handle a single TCP relay request."""
+        try:
+            conn.settimeout(10)
+            raw = b''
+            while b'\n' not in raw and len(raw) < 65536:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+            if not raw:
+                return
+            msg = json.loads(raw.strip())
+            if msg.get('type') == 'send':
+                target = msg.get('target', '')
+                message = msg.get('message', '')
+                sender = msg.get('sender', 'remote')
+                # Find local workers matching target (local only, no network recursion)
+                all_workers = Registry.discover(include_remote=False)
+                live = [w for w in all_workers if w['alive']]
+                # Match by worker_name or session_id:worker_name
+                if ':' in target:
+                    sid, wname = target.split(':', 1)
+                    matches = [w for w in live
+                               if w['session_id'].startswith(sid)
+                               and w['worker_name'] == wname]
+                else:
+                    matches = [w for w in live if w['worker_name'] == target]
+                if not matches:
+                    reply = {'ok': False, 'error': f'no local worker: {target}'}
+                else:
+                    for w in matches:
+                        ipc = IPC(w['ipc_dir'])
+                        ipc.send_input(message, sender=sender)
+                    reply = {'ok': True, 'delivered': len(matches)}
+                conn.sendall(json.dumps(reply).encode() + b'\n')
+            else:
+                conn.sendall(json.dumps({'ok': False, 'error': 'unknown type'}).encode() + b'\n')
+        except Exception:
+            try:
+                conn.sendall(json.dumps({'ok': False, 'error': 'internal'}).encode() + b'\n')
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+
+# Singleton beacon — started once per process that needs it
+_beacon: Optional[NetworkBeacon] = None
+
+
+def ensure_beacon():
+    """Start the network beacon if not already running."""
+    global _beacon
+    if _beacon is None:
+        _beacon = NetworkBeacon()
+        _beacon.start()
+
+
+def network_discover(timeout: float = 0.5) -> list[dict]:
+    """Send UDP broadcast probe and collect remote worker announcements.
+
+    Returns list of worker dicts with extra keys: host, ip, remote=True.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(timeout)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+
+    probe = _UDP_MAGIC + json.dumps({'type': 'discover'}).encode()
+    try:
+        sock.sendto(probe, (_BROADCAST_ADDR, DDLL_NET_PORT))
+    except OSError:
+        sock.close()
+        return []
+
+    local_ips = set(_get_local_ips())
+    results = []
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sock.settimeout(remaining)
+        try:
+            data, addr = sock.recvfrom(65536)
+        except socket.timeout:
+            break
+        except OSError:
+            break
+        if addr[0] in local_ips:
+            continue
+        if not data.startswith(_UDP_MAGIC):
+            continue
+        try:
+            msg = json.loads(data[len(_UDP_MAGIC):])
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if msg.get('type') != 'announce':
+            continue
+        host = msg.get('host', addr[0])
+        ip = msg.get('ip', addr[0])
+        port = msg.get('port', DDLL_NET_PORT)
+        for w in msg.get('workers', []):
+            results.append({
+                'session_id': w.get('session_id', '?'),
+                'worker_name': w.get('worker_name', '?'),
+                'task': w.get('task', ''),
+                'directory': w.get('directory', ''),
+                'pid': None,
+                'alive': True,
+                'ipc_dir': '',  # not accessible remotely
+                'host': host,
+                'ip': ip,
+                'port': port,
+                'remote': True,
+            })
+    sock.close()
+    return results
+
+
+def network_send(ip: str, port: int, target: str, message: str,
+                 sender: str = 'remote') -> dict:
+    """Send a message to a remote dedelulu instance via TCP.
+
+    Returns the server's JSON reply dict.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10)
+    try:
+        sock.connect((ip, port))
+        payload = json.dumps({
+            'type': 'send',
+            'target': target,
+            'message': message,
+            'sender': sender,
+        }).encode() + b'\n'
+        sock.sendall(payload)
+        # Read reply
+        raw = b''
+        while b'\n' not in raw and len(raw) < 65536:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+        return json.loads(raw.strip()) if raw.strip() else {'ok': False, 'error': 'no reply'}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+    finally:
+        sock.close()
+
+
+# =============================================================================
+# Registry — discover all dedelulu instances (local + network)
 # =============================================================================
 
 class Registry:
-    """Scans /tmp for live dedelulu sessions and their workers."""
+    """Scans /tmp for live dedelulu sessions and the LAN for remote instances."""
 
     SESSION_GLOB = os.path.join(tempfile.gettempdir(), 'dedelulu_session_*')
 
     @classmethod
-    def discover(cls) -> list[dict]:
-        """Return list of live workers across all sessions on this machine.
+    def discover(cls, include_remote: bool = True) -> list[dict]:
+        """Return list of live workers across all sessions.
 
-        Each entry: {session_dir, session_id, worker_name, task, directory, pid, alive, ipc_dir}
+        Local entries: {session_dir, session_id, worker_name, task, directory,
+                        pid, alive, ipc_dir, host, remote=False}
+        Remote entries: same but remote=True, host/ip/port set, ipc_dir empty.
         """
         import glob as _glob
+        hostname = _get_hostname()
         results = []
         for session_dir in sorted(_glob.glob(cls.SESSION_GLOB)):
             session_file = os.path.join(session_dir, 'session.json')
@@ -985,7 +1323,18 @@ class Registry:
                     'pid': pid,
                     'alive': alive,
                     'ipc_dir': ipc_dir,
+                    'host': hostname,
+                    'remote': False,
                 })
+
+        # Network discovery (LAN broadcast)
+        if include_remote:
+            try:
+                remote = network_discover(timeout=0.5)
+                results.extend(remote)
+            except Exception:
+                pass  # network not available
+
         return results
 
     @classmethod
@@ -1026,9 +1375,10 @@ class Registry:
         if len(matches) <= 1:
             return matches
 
-        # Multiple matches: prefer same session
+        # Multiple matches: prefer same session (local only)
         if prefer_session:
-            same = [w for w in matches if w['session_dir'] == prefer_session]
+            same = [w for w in matches
+                    if w.get('session_dir') == prefer_session]
             if same:
                 return same
 
@@ -1130,6 +1480,7 @@ class Session:
 
 def run_foreman(session_dir: str):
     """Foreman process: shows events from all workers, handles commands."""
+    ensure_beacon()
     session = Session.load(session_dir)
 
     # Track file positions for each worker's events
@@ -1746,6 +2097,9 @@ class Supervisor:
 
     def start(self) -> int:
         """Spawn child and run the supervisor loop. Returns exit code."""
+        # Start network beacon for cross-host discovery
+        ensure_beacon()
+
         # Install hooks before spawning claude
         if self._use_hooks:
             self._install_hooks()
@@ -2943,9 +3297,9 @@ def explore_main():
 
     # Workers table
     if live:
-        fmt = '{:<12} {:<12} {:<8} {:<8} {:<30} {}'
-        print(fmt.format('SESSION', 'WORKER', 'TYPE', 'PID', 'DIR', 'TASK'))
-        print(fmt.format('─' * 12, '─' * 12, '─' * 8, '─' * 8, '─' * 30, '─' * 30))
+        fmt = '{:<12} {:<12} {:<8} {:<8} {:<16} {:<24} {}'
+        print(fmt.format('SESSION', 'WORKER', 'TYPE', 'PID', 'HOST', 'DIR', 'TASK'))
+        print(fmt.format('─' * 12, '─' * 12, '─' * 8, '─' * 8, '─' * 16, '─' * 24, '─' * 30))
         for w in live:
             sid = w['session_id'][:12]
             directory = w['directory']
@@ -2953,9 +3307,19 @@ def explore_main():
             if directory.startswith(home):
                 directory = '~' + directory[len(home):]
             wtype = 'claude' if 'claude' in w.get('task', '').lower() else 'local'
+            pid_str = str(w['pid'] or '?') if not w.get('remote') else '—'
+            if w.get('remote'):
+                host = w.get('host', w.get('ip', '?'))
+                ip_suffix = w.get('ip', '')
+                # Show short IP suffix for compactness (e.g. ".8.107")
+                if ip_suffix and host != ip_suffix:
+                    parts = ip_suffix.split('.')
+                    host = f"{host} .{parts[-1]}"
+            else:
+                host = '(local)'
             print(fmt.format(
-                sid, w['worker_name'], wtype, str(w['pid'] or '?'),
-                directory[:30], w['task'][:50],
+                sid, w['worker_name'], wtype, pid_str,
+                host[:16], directory[:24], w['task'][:40],
             ))
 
     # LLM endpoints table
@@ -3073,9 +3437,20 @@ def send_main():
             print(f"[{endpoint.name}]: {response}")
             continue
 
-        ipc = IPC(w['ipc_dir'])
-        ipc.send_input(message, sender=sender)
-        print(f"sent to [{w['session_id'][:8]}:{w['worker_name']}]")
+        if w.get('remote'):
+            # Send via TCP to remote host
+            reply = network_send(w['ip'], w.get('port', DDLL_NET_PORT),
+                                 w['worker_name'], message, sender=sender)
+            if reply.get('ok'):
+                print(f"sent to [{w['session_id'][:8]}:{w['worker_name']}]"
+                      f" @ {w.get('host', w['ip'])}")
+            else:
+                print(f"error sending to {w['worker_name']}@{w.get('host', w['ip'])}: "
+                      f"{reply.get('error', '?')}", file=sys.stderr)
+        else:
+            ipc = IPC(w['ipc_dir'])
+            ipc.send_input(message, sender=sender)
+            print(f"sent to [{w['session_id'][:8]}:{w['worker_name']}]")
 
 
 def ask_main():
