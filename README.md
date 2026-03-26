@@ -415,6 +415,71 @@ ddll send gpt54 "what is 42+7 in Z80 assembly, using ADD A,immediate?"
 ddll ask gpt54 "are these consistent? @src/types.go @src/handler.go @src/routes.go"
 ```
 
+## Comparison: dedelulu vs NVIDIA NemoClaw
+
+[NemoClaw](https://github.com/NVIDIA/NemoClaw) is NVIDIA's open-source reference stack
+for running OpenClaw agents securely inside sandboxed containers. dedelulu and NemoClaw
+solve **different halves of the same problem** — they're complementary, not competing.
+
+| Aspect | **NemoClaw** | **dedelulu** |
+|---|---|---|
+| Core purpose | Sandbox security for agents | Autonomous supervision of agents |
+| What it controls | What the agent *can't* do | What the agent *should* do |
+| Agent | OpenClaw | Claude Code (or any CLI) |
+| Isolation | Full container (Landlock, seccomp, netns) | PTY wrapper, no isolation |
+| Network policy | Declarative YAML egress control | None |
+| Inference routing | Gateway intercepts all LLM calls | Direct `ddll ask`/`ddll send` |
+| Approval flow | TUI for operator approval of blocked requests | Auto-approve patterns + LLM supervisor |
+| Behavior supervision | None | 3-level: patterns, LLM supervisor, interventor |
+| Stale detection | None | Yes, with LLM-powered nudging |
+| Multi-agent | Single sandbox per agent | Multi-worker sessions, cross-agent messaging |
+| External LLM access | Provider-routed through gateway | `ddll ask` (Azure, OpenAI, Anthropic, Gemini, Ollama) |
+| Credential handling | Keys on host, sandbox sees `inference.local` only | Keys in env vars, shared with agent |
+
+### What dedelulu could learn from NemoClaw
+
+- **Network egress policy** — declarative YAML controlling what the agent can access.
+  Currently dedelulu trusts agents completely on network. Even lightweight egress
+  logging (not blocking) would improve auditability.
+- **Inference interception** — NemoClaw's gateway intercepts all LLM API calls from the
+  agent. Useful for logging, cost tracking, and enforcing model policies.
+- **Credential isolation** — keeping API keys on the host and exposing only a local
+  proxy endpoint to the agent. Important for multi-agent setups where workers
+  shouldn't see each other's (or the user's) keys.
+
+### What NemoClaw could learn from dedelulu
+
+- **LLM-based behavior supervision** — NemoClaw has zero behavior monitoring. If the
+  agent goes off-rails, nobody notices until damage is done. dedelulu's 3-level
+  supervision (fast patterns, LLM health checks, human escalation) would catch
+  stuck/derailing agents early.
+- **Cross-agent messaging** — NemoClaw is single-sandbox with no agent-to-agent
+  communication. dedelulu's IPC fabric (`ddll send`/`ddll explore`) enables
+  multi-agent collaboration and LLM consultation.
+- **Stale detection + nudging** — agents can hang forever in NemoClaw with no detection.
+  dedelulu detects idle agents and nudges them (mimicking the user's style).
+- **Auto-approval patterns** — NemoClaw requires manual TUI approval for many operations.
+  dedelulu's 70+ regex patterns auto-approve common safe prompts (y/n, press enter,
+  npm proceed, etc.) without human intervention.
+- **External LLM consultation** — agents inside NemoClaw's sandbox can't reach external
+  LLMs (blocked by policy). `ddll ask` via the host could provide a controlled,
+  policy-compliant channel for cross-model consultation.
+
+### The dream combo
+
+NemoClaw's sandbox + dedelulu's supervision = an agent that **can't do bad things**
+(security) AND **stays on track** (behavior). A potential integration path:
+
+```
+NemoClaw sandbox (security envelope)
+  └── dedelulu supervisor (behavior envelope)
+        └── Claude Code / OpenClaw (the agent)
+              ├── auto-approved by dedelulu patterns + hooks
+              ├── behavior-checked by LLM supervisor
+              ├── network-controlled by NemoClaw policy
+              └── inference-routed through NemoClaw gateway
+```
+
 ## E2E Guide
 
 See **[E2E_GUIDE.md](E2E_GUIDE.md)** for complete walkthroughs: simple tasks,
