@@ -934,7 +934,7 @@ def _extract_inline_files(parts: list) -> tuple:
 
 
 # =============================================================================
-# Network — cross-host autodiscovery and message relay (LAN)
+# Network — cross-host autodiscovery and persistent peer connections (LAN)
 # =============================================================================
 
 import socket
@@ -943,6 +943,8 @@ import threading
 DDLL_NET_PORT = int(os.getenv('DDLL_NET_PORT', '19547'))
 _BROADCAST_ADDR = '<broadcast>'
 _UDP_MAGIC = b'DDLL'  # 4-byte prefix to filter stray packets
+_PEER_HEARTBEAT = 30   # seconds between heartbeats on persistent connections
+_PEER_STALE = 90       # seconds before a peer is considered dead
 
 
 def _get_hostname() -> str:
@@ -961,7 +963,6 @@ def _get_local_ips() -> list[str]:
     except Exception:
         pass
     if not ips:
-        # Fallback: connect to broadcast to find default interface
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(('192.168.255.255', 1))
@@ -972,76 +973,200 @@ def _get_local_ips() -> list[str]:
     return ips
 
 
+def _local_workers_snapshot() -> list[dict]:
+    """Snapshot of local live workers for announcements."""
+    import glob as _glob
+    results = []
+    for session_dir in sorted(_glob.glob(
+            os.path.join(tempfile.gettempdir(), 'dedelulu_session_*'))):
+        session_file = os.path.join(session_dir, 'session.json')
+        if not os.path.isfile(session_file):
+            continue
+        try:
+            with open(session_file) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        session_id = os.path.basename(session_dir).replace('dedelulu_session_', '')
+        for wd in data.get('workers', []):
+            ipc_dir = wd.get('ipc_dir', '')
+            pid_path = os.path.join(ipc_dir, 'pid') if ipc_dir else ''
+            alive = False
+            if pid_path and os.path.isfile(pid_path):
+                try:
+                    with open(pid_path) as f:
+                        pid = int(f.read().strip())
+                    os.kill(pid, 0)
+                    alive = True
+                except (ValueError, ProcessLookupError, PermissionError, OSError):
+                    pass
+            if alive:
+                results.append({
+                    'session_id': session_id,
+                    'worker_name': wd.get('name', '?'),
+                    'task': wd.get('task', ''),
+                    'directory': wd.get('directory', ''),
+                })
+    return results
+
+
+def _tcp_read_msg(sock: socket.socket, timeout: float = 10) -> Optional[dict]:
+    """Read a single JSON line from a TCP socket."""
+    sock.settimeout(timeout)
+    raw = b''
+    while b'\n' not in raw and len(raw) < 65536:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            return None
+        if not chunk:
+            return None
+        raw += chunk
+    try:
+        return json.loads(raw.strip())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _tcp_send_msg(sock: socket.socket, msg: dict):
+    """Send a JSON line over a TCP socket."""
+    sock.sendall(json.dumps(msg).encode() + b'\n')
+
+
+# =============================================================================
+# Peer registry — tracks known remote hosts and their workers
+# =============================================================================
+
+_peers_lock = threading.Lock()
+_peers: dict[str, dict] = {}  # ip -> {host, ip, port, workers, last_seen, conn}
+
+
+def _peer_update(ip: str, host: str, port: int, workers: list,
+                 conn: socket.socket = None):
+    """Update or add a peer in the registry."""
+    with _peers_lock:
+        existing = _peers.get(ip)
+        if existing and conn is None:
+            conn = existing.get('conn')  # preserve existing connection
+        _peers[ip] = {
+            'host': host, 'ip': ip, 'port': port,
+            'workers': workers,
+            'last_seen': time.monotonic(),
+            'conn': conn,
+        }
+
+
+def _peer_remove(ip: str):
+    """Remove a peer and close its connection."""
+    with _peers_lock:
+        peer = _peers.pop(ip, None)
+    if peer and peer.get('conn'):
+        try:
+            peer['conn'].close()
+        except Exception:
+            pass
+
+
+def _peer_get_conn(ip: str) -> Optional[socket.socket]:
+    """Get persistent connection to a peer."""
+    with _peers_lock:
+        peer = _peers.get(ip)
+        if peer:
+            return peer.get('conn')
+    return None
+
+
+def _peer_set_conn(ip: str, conn: socket.socket):
+    """Set persistent connection for a peer."""
+    with _peers_lock:
+        if ip in _peers:
+            old = _peers[ip].get('conn')
+            if old and old is not conn:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            _peers[ip]['conn'] = conn
+
+
+def peer_workers() -> list[dict]:
+    """Get all workers from known peers (for Registry.discover)."""
+    now = time.monotonic()
+    results = []
+    stale = []
+    with _peers_lock:
+        for ip, peer in _peers.items():
+            if now - peer['last_seen'] > _PEER_STALE:
+                stale.append(ip)
+                continue
+            for w in peer['workers']:
+                results.append({
+                    'session_id': w.get('session_id', '?'),
+                    'worker_name': w.get('worker_name', '?'),
+                    'task': w.get('task', ''),
+                    'directory': w.get('directory', ''),
+                    'pid': None,
+                    'alive': True,
+                    'ipc_dir': '',
+                    'host': peer['host'],
+                    'ip': ip,
+                    'port': peer['port'],
+                    'remote': True,
+                })
+    # Clean up stale peers outside lock
+    for ip in stale:
+        _peer_remove(ip)
+    return results
+
+
+# =============================================================================
+# NetworkBeacon — UDP discovery + persistent TCP peer connections
+# =============================================================================
+
 class NetworkBeacon:
-    """Background daemon that answers UDP discovery probes and relays TCP messages.
+    """Background daemon for LAN autodiscovery and persistent peer connections.
+
+    Architecture:
+        1. UDP broadcast for initial discovery (either direction)
+        2. Discoverer opens persistent TCP connection to discovered host
+        3. Both sides exchange worker lists over TCP ("announce")
+        4. Messages relay over persistent TCP connection ("send")
+        5. Periodic heartbeat re-announces workers to keep connection alive
+        6. On disconnect — peer marked stale, re-discovered on next UDP cycle
 
     Protocol:
         UDP broadcast (port DDLL_NET_PORT):
             probe:   DDLL + JSON {"type": "discover"}
-            reply:   DDLL + JSON {"type": "announce", "host": "...", "ip": "...",
-                                   "port": 19547, "workers": [...]}
+            reply:   DDLL + JSON {"type": "announce", "host", "ip", "port", "workers"}
 
-        TCP (port DDLL_NET_PORT):
-            client sends: JSON line {"type": "send", "target": "...",
-                                      "message": "...", "sender": "..."}
-            server replies: JSON line {"ok": true} or {"ok": false, "error": "..."}
+        TCP persistent (port DDLL_NET_PORT), newline-delimited JSON:
+            announce: {"type": "announce", "host", "ip", "port", "workers"}
+            send:     {"type": "send", "target", "message", "sender"}
+              reply:  {"ok": true/false, ...}
+            heartbeat: {"type": "announce", ...}  (same as announce, periodic)
     """
 
     def __init__(self):
         self._stop = threading.Event()
-        self._udp_thread = None
-        self._tcp_thread = None
 
     def start(self):
-        """Start beacon threads (daemonic — dies with main process)."""
-        self._udp_thread = threading.Thread(target=self._udp_loop, daemon=True,
-                                             name='ddll-beacon-udp')
-        self._tcp_thread = threading.Thread(target=self._tcp_loop, daemon=True,
-                                             name='ddll-beacon-tcp')
-        self._udp_thread.start()
-        self._tcp_thread.start()
+        """Start all beacon threads (daemonic)."""
+        threads = [
+            ('ddll-udp', self._udp_loop),
+            ('ddll-tcp-listen', self._tcp_listen_loop),
+            ('ddll-heartbeat', self._heartbeat_loop),
+        ]
+        for name, target in threads:
+            t = threading.Thread(target=target, daemon=True, name=name)
+            t.start()
 
     def stop(self):
         self._stop.set()
 
-    def _local_workers_payload(self) -> list[dict]:
-        """Snapshot of local live workers for announcements."""
-        import glob as _glob
-        results = []
-        for session_dir in sorted(_glob.glob(
-                os.path.join(tempfile.gettempdir(), 'dedelulu_session_*'))):
-            session_file = os.path.join(session_dir, 'session.json')
-            if not os.path.isfile(session_file):
-                continue
-            try:
-                with open(session_file) as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-            session_id = os.path.basename(session_dir).replace('dedelulu_session_', '')
-            for wd in data.get('workers', []):
-                ipc_dir = wd.get('ipc_dir', '')
-                pid_path = os.path.join(ipc_dir, 'pid') if ipc_dir else ''
-                alive = False
-                if pid_path and os.path.isfile(pid_path):
-                    try:
-                        with open(pid_path) as f:
-                            pid = int(f.read().strip())
-                        os.kill(pid, 0)
-                        alive = True
-                    except (ValueError, ProcessLookupError, PermissionError, OSError):
-                        pass
-                if alive:
-                    results.append({
-                        'session_id': session_id,
-                        'worker_name': wd.get('name', '?'),
-                        'task': wd.get('task', ''),
-                        'directory': wd.get('directory', ''),
-                    })
-        return results
+    # --- UDP discovery ---
 
     def _udp_loop(self):
-        """Listen for UDP discovery probes and reply with local workers."""
+        """Listen for UDP probes, reply, and initiate TCP to new peers."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -1052,7 +1177,7 @@ class NetworkBeacon:
         try:
             sock.bind(('', DDLL_NET_PORT))
         except OSError:
-            return  # port in use — another beacon already running
+            return  # port in use — another beacon running
         local_ips = set(_get_local_ips())
         hostname = _get_hostname()
 
@@ -1063,7 +1188,6 @@ class NetworkBeacon:
                 continue
             except OSError:
                 break
-            # Ignore our own broadcasts
             if addr[0] in local_ips:
                 continue
             if not data.startswith(_UDP_MAGIC):
@@ -1072,26 +1196,108 @@ class NetworkBeacon:
                 msg = json.loads(data[len(_UDP_MAGIC):])
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
-            if msg.get('type') != 'discover':
-                continue
-            # Reply with our workers
-            workers = self._local_workers_payload()
-            reply = {
-                'type': 'announce',
-                'host': hostname,
-                'ip': _get_local_ips()[0] if _get_local_ips() else addr[0],
-                'port': DDLL_NET_PORT,
-                'workers': workers,
-            }
-            reply_data = _UDP_MAGIC + json.dumps(reply).encode()
-            try:
-                sock.sendto(reply_data, addr)
-            except OSError:
-                pass
+
+            if msg.get('type') == 'discover':
+                # Reply with our workers
+                workers = _local_workers_snapshot()
+                reply = {
+                    'type': 'announce', 'host': hostname,
+                    'ip': _get_local_ips()[0] if _get_local_ips() else addr[0],
+                    'port': DDLL_NET_PORT, 'workers': workers,
+                }
+                try:
+                    sock.sendto(_UDP_MAGIC + json.dumps(reply).encode(), addr)
+                except OSError:
+                    pass
+                # If we don't have a persistent connection to this peer, open one
+                if not _peer_get_conn(addr[0]):
+                    threading.Thread(target=self._connect_to_peer,
+                                     args=(addr[0], DDLL_NET_PORT),
+                                     daemon=True).start()
+
+            elif msg.get('type') == 'announce':
+                # Got an announcement (reply to our probe)
+                host = msg.get('host', addr[0])
+                ip = msg.get('ip', addr[0])
+                port = msg.get('port', DDLL_NET_PORT)
+                _peer_update(ip, host, port, msg.get('workers', []))
+                # Open persistent TCP if not connected
+                if not _peer_get_conn(ip):
+                    threading.Thread(target=self._connect_to_peer,
+                                     args=(ip, port), daemon=True).start()
         sock.close()
 
-    def _tcp_loop(self):
-        """Listen for TCP message relay requests."""
+    # --- Persistent TCP connections ---
+
+    def _connect_to_peer(self, ip: str, port: int):
+        """Open persistent TCP connection to a peer and run read loop."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((ip, port))
+            # Send our announcement
+            hostname = _get_hostname()
+            workers = _local_workers_snapshot()
+            local_ip = _get_local_ips()[0] if _get_local_ips() else ''
+            _tcp_send_msg(sock, {
+                'type': 'announce', 'host': hostname,
+                'ip': local_ip, 'port': DDLL_NET_PORT,
+                'workers': workers,
+            })
+            _peer_set_conn(ip, sock)
+            # Read loop — handle incoming messages on this connection
+            self._peer_read_loop(sock, ip)
+        except Exception:
+            _peer_remove(ip)
+
+    def _peer_read_loop(self, sock: socket.socket, peer_ip: str):
+        """Read messages from a persistent peer connection."""
+        while not self._stop.is_set():
+            msg = _tcp_read_msg(sock, timeout=_PEER_HEARTBEAT + 30)
+            if msg is None:
+                break  # disconnected or timeout
+            self._handle_peer_msg(sock, msg, peer_ip)
+        _peer_remove(peer_ip)
+
+    def _handle_peer_msg(self, conn: socket.socket, msg: dict, peer_ip: str):
+        """Process a message from a peer connection."""
+        msg_type = msg.get('type')
+
+        if msg_type == 'announce':
+            host = msg.get('host', peer_ip)
+            port = msg.get('port', DDLL_NET_PORT)
+            _peer_update(peer_ip, host, port, msg.get('workers', []), conn=conn)
+
+        elif msg_type == 'send':
+            target = msg.get('target', '')
+            message = msg.get('message', '')
+            sender = msg.get('sender', 'remote')
+            # Deliver to local workers
+            all_workers = Registry.discover(include_remote=False)
+            live = [w for w in all_workers if w['alive']]
+            if ':' in target:
+                sid, wname = target.split(':', 1)
+                matches = [w for w in live
+                           if w['session_id'].startswith(sid)
+                           and w['worker_name'] == wname]
+            else:
+                matches = [w for w in live if w['worker_name'] == target]
+            if not matches:
+                reply = {'ok': False, 'error': f'no local worker: {target}'}
+            else:
+                for w in matches:
+                    ipc = IPC(w['ipc_dir'])
+                    ipc.send_input(message, sender=sender)
+                reply = {'ok': True, 'delivered': len(matches)}
+            try:
+                _tcp_send_msg(conn, reply)
+            except Exception:
+                pass
+
+    # --- TCP listen (accept incoming peer connections) ---
+
+    def _tcp_listen_loop(self):
+        """Accept incoming persistent TCP connections from peers."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(1.0)
@@ -1099,7 +1305,7 @@ class NetworkBeacon:
             sock.bind(('', DDLL_NET_PORT))
         except OSError:
             return  # port in use
-        sock.listen(8)
+        sock.listen(16)
 
         while not self._stop.is_set():
             try:
@@ -1108,58 +1314,70 @@ class NetworkBeacon:
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._handle_tcp, args=(conn,),
-                             daemon=True).start()
+            threading.Thread(target=self._handle_incoming_peer,
+                             args=(conn, addr[0]), daemon=True).start()
         sock.close()
 
-    def _handle_tcp(self, conn: socket.socket):
-        """Handle a single TCP relay request."""
+    def _handle_incoming_peer(self, conn: socket.socket, peer_ip: str):
+        """Handle an incoming peer TCP connection (persistent read loop)."""
+        _peer_set_conn(peer_ip, conn)
+        # Send our announcement back
         try:
-            conn.settimeout(10)
-            raw = b''
-            while b'\n' not in raw and len(raw) < 65536:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                raw += chunk
-            if not raw:
-                return
-            msg = json.loads(raw.strip())
-            if msg.get('type') == 'send':
-                target = msg.get('target', '')
-                message = msg.get('message', '')
-                sender = msg.get('sender', 'remote')
-                # Find local workers matching target (local only, no network recursion)
-                all_workers = Registry.discover(include_remote=False)
-                live = [w for w in all_workers if w['alive']]
-                # Match by worker_name or session_id:worker_name
-                if ':' in target:
-                    sid, wname = target.split(':', 1)
-                    matches = [w for w in live
-                               if w['session_id'].startswith(sid)
-                               and w['worker_name'] == wname]
-                else:
-                    matches = [w for w in live if w['worker_name'] == target]
-                if not matches:
-                    reply = {'ok': False, 'error': f'no local worker: {target}'}
-                else:
-                    for w in matches:
-                        ipc = IPC(w['ipc_dir'])
-                        ipc.send_input(message, sender=sender)
-                    reply = {'ok': True, 'delivered': len(matches)}
-                conn.sendall(json.dumps(reply).encode() + b'\n')
-            else:
-                conn.sendall(json.dumps({'ok': False, 'error': 'unknown type'}).encode() + b'\n')
+            hostname = _get_hostname()
+            workers = _local_workers_snapshot()
+            local_ip = _get_local_ips()[0] if _get_local_ips() else ''
+            _tcp_send_msg(conn, {
+                'type': 'announce', 'host': hostname,
+                'ip': local_ip, 'port': DDLL_NET_PORT,
+                'workers': workers,
+            })
         except Exception:
+            _peer_remove(peer_ip)
+            return
+        self._peer_read_loop(conn, peer_ip)
+
+    # --- Heartbeat ---
+
+    def _heartbeat_loop(self):
+        """Periodically re-announce workers to all connected peers."""
+        while not self._stop.is_set():
+            self._stop.wait(_PEER_HEARTBEAT)
+            if self._stop.is_set():
+                break
+            hostname = _get_hostname()
+            workers = _local_workers_snapshot()
+            local_ip = _get_local_ips()[0] if _get_local_ips() else ''
+            msg = {
+                'type': 'announce', 'host': hostname,
+                'ip': local_ip, 'port': DDLL_NET_PORT,
+                'workers': workers,
+            }
+            # Send to all connected peers
+            with _peers_lock:
+                conns = [(ip, p.get('conn')) for ip, p in _peers.items()
+                         if p.get('conn')]
+            dead = []
+            for ip, conn in conns:
+                try:
+                    _tcp_send_msg(conn, msg)
+                except Exception:
+                    dead.append(ip)
+            for ip in dead:
+                _peer_remove(ip)
+
+            # Also send periodic UDP probe to find new peers
             try:
-                conn.sendall(json.dumps({'ok': False, 'error': 'internal'}).encode() + b'\n')
+                probe_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                probe_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                probe_sock.settimeout(0.5)
+                probe = _UDP_MAGIC + json.dumps({'type': 'discover'}).encode()
+                probe_sock.sendto(probe, (_BROADCAST_ADDR, DDLL_NET_PORT))
+                probe_sock.close()
             except Exception:
                 pass
-        finally:
-            conn.close()
 
 
-# Singleton beacon — started once per process that needs it
+# Singleton beacon
 _beacon: Optional[NetworkBeacon] = None
 
 
@@ -1172,10 +1390,15 @@ def ensure_beacon():
 
 
 def network_discover(timeout: float = 0.5) -> list[dict]:
-    """Send UDP broadcast probe and collect remote worker announcements.
+    """Get remote workers: from persistent peers + fresh UDP probe.
 
     Returns list of worker dicts with extra keys: host, ip, remote=True.
     """
+    # First, return what we already know from persistent connections
+    results = peer_workers()
+    known_ips = {w['ip'] for w in results}
+
+    # Also do a quick UDP probe for any new peers we haven't connected to yet
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.settimeout(timeout)
@@ -1189,11 +1412,10 @@ def network_discover(timeout: float = 0.5) -> list[dict]:
         sock.sendto(probe, (_BROADCAST_ADDR, DDLL_NET_PORT))
     except OSError:
         sock.close()
-        return []
+        return results
 
     local_ips = set(_get_local_ips())
-    results = []
-    seen_ips = set()  # deduplicate multiple beacons on same host
+    seen_ips = set()
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
@@ -1207,10 +1429,8 @@ def network_discover(timeout: float = 0.5) -> list[dict]:
             break
         except OSError:
             break
-        if addr[0] in local_ips:
+        if addr[0] in local_ips or addr[0] in seen_ips:
             continue
-        if addr[0] in seen_ips:
-            continue  # already got announcement from this host
         if not data.startswith(_UDP_MAGIC):
             continue
         try:
@@ -1223,49 +1443,56 @@ def network_discover(timeout: float = 0.5) -> list[dict]:
         host = msg.get('host', addr[0])
         ip = msg.get('ip', addr[0])
         port = msg.get('port', DDLL_NET_PORT)
-        for w in msg.get('workers', []):
-            results.append({
-                'session_id': w.get('session_id', '?'),
-                'worker_name': w.get('worker_name', '?'),
-                'task': w.get('task', ''),
-                'directory': w.get('directory', ''),
-                'pid': None,
-                'alive': True,
-                'ipc_dir': '',  # not accessible remotely
-                'host': host,
-                'ip': ip,
-                'port': port,
-                'remote': True,
-            })
+        workers = msg.get('workers', [])
+        # Update peer registry (will trigger TCP connect via beacon)
+        _peer_update(ip, host, port, workers)
+        # Add to results if not already known
+        if ip not in known_ips:
+            for w in workers:
+                results.append({
+                    'session_id': w.get('session_id', '?'),
+                    'worker_name': w.get('worker_name', '?'),
+                    'task': w.get('task', ''),
+                    'directory': w.get('directory', ''),
+                    'pid': None,
+                    'alive': True,
+                    'ipc_dir': '',
+                    'host': host,
+                    'ip': ip,
+                    'port': port,
+                    'remote': True,
+                })
     sock.close()
     return results
 
 
 def network_send(ip: str, port: int, target: str, message: str,
                  sender: str = 'remote') -> dict:
-    """Send a message to a remote dedelulu instance via TCP.
+    """Send a message to a remote worker via persistent peer connection.
 
-    Returns the server's JSON reply dict.
+    Falls back to one-shot TCP if no persistent connection exists.
     """
+    msg = {'type': 'send', 'target': target, 'message': message, 'sender': sender}
+
+    # Try persistent connection first
+    conn = _peer_get_conn(ip)
+    if conn:
+        try:
+            _tcp_send_msg(conn, msg)
+            reply = _tcp_read_msg(conn, timeout=10)
+            if reply:
+                return reply
+        except Exception:
+            _peer_remove(ip)
+
+    # Fallback: one-shot TCP
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)
     try:
         sock.connect((ip, port))
-        payload = json.dumps({
-            'type': 'send',
-            'target': target,
-            'message': message,
-            'sender': sender,
-        }).encode() + b'\n'
-        sock.sendall(payload)
-        # Read reply
-        raw = b''
-        while b'\n' not in raw and len(raw) < 65536:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            raw += chunk
-        return json.loads(raw.strip()) if raw.strip() else {'ok': False, 'error': 'no reply'}
+        _tcp_send_msg(sock, msg)
+        reply = _tcp_read_msg(sock, timeout=10)
+        return reply or {'ok': False, 'error': 'no reply'}
     except Exception as e:
         return {'ok': False, 'error': str(e)}
     finally:
