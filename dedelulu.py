@@ -1193,6 +1193,7 @@ def network_discover(timeout: float = 0.5) -> list[dict]:
 
     local_ips = set(_get_local_ips())
     results = []
+    seen_ips = set()  # deduplicate multiple beacons on same host
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
@@ -1208,6 +1209,8 @@ def network_discover(timeout: float = 0.5) -> list[dict]:
             break
         if addr[0] in local_ips:
             continue
+        if addr[0] in seen_ips:
+            continue  # already got announcement from this host
         if not data.startswith(_UDP_MAGIC):
             continue
         try:
@@ -1216,6 +1219,7 @@ def network_discover(timeout: float = 0.5) -> list[dict]:
             continue
         if msg.get('type') != 'announce':
             continue
+        seen_ips.add(addr[0])
         host = msg.get('host', addr[0])
         ip = msg.get('ip', addr[0])
         port = msg.get('port', DDLL_NET_PORT)
