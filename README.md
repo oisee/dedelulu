@@ -94,6 +94,10 @@ dedelulu --provider anthropic claude "fix login bug"
 # OpenAI API
 dedelulu --provider openai claude "add tests"
 
+# Google Gemini
+dedelulu --provider google claude "refactor auth"
+dedelulu --provider gemini claude "add tests"
+
 # Another Claude Code instance (Max subscription, no API cost)
 dedelulu --provider claude-cli claude "refactor everything"
 ```
@@ -101,11 +105,19 @@ dedelulu --provider claude-cli claude "refactor everything"
 ### Multi-worker: parallel agents
 
 ```bash
+# Claude Code workers
 dedelulu-multi \
   --worker "api:~/project:implement REST endpoints" \
   --worker "tests:~/project:write comprehensive tests" \
   --provider azure
 
+# Gemini CLI workers
+dedelulu-multi \
+  --agent gemini \
+  --worker "api:~/project:implement REST endpoints" \
+  --worker "tests:~/project:write comprehensive tests" \
+  --provider google
+```
 # Foreman commands (in the bottom pane):
 /send api "freeze the API, tests is starting"
 /broadcast "commit and push"
@@ -120,8 +132,8 @@ dedelulu-multi \
 
 ```
 --idle SECS         Seconds of silence before auto-responding (default: 4)
---provider          LLM for supervisor: none|ollama|anthropic|openai|azure|claude-cli
---model MODEL       Specific model (default: gpt-4o for azure, qwen3:4b for ollama)
+--provider          LLM for supervisor: none|ollama|anthropic|openai|azure|google|gemini|claude-cli
+--model MODEL       Specific model (default: gpt-4o for azure, qwen3:4b for ollama, gemini-2.5-flash for google)
 --goal GOAL         What the agent should accomplish (auto-extracted from claude command)
 --supervise SECS    Supervisor check interval (default: 60s when provider is set)
 --dry-run           Detect prompts but don't send responses
@@ -141,6 +153,9 @@ export AZURE_OPENAI_API_KEY=your-key
 export AZURE_OPENAI_DEPLOYMENT=gpt-4o    # or gpt-5.2, gpt-5.4
 export AZURE_OPENAI_API_VERSION=2024-12-01-preview
 
+# Google Gemini
+export GEMINI_API_KEY=your-api-key-from-ai-studio
+
 # Ollama
 export OLLAMA_HOST=192.168.1.100     # bare IP, or http://host:port
 
@@ -157,6 +172,7 @@ export OPENAI_API_KEY=sk-...
 |----------|-------|------|-------|
 | `none` | instant | free | nothing |
 | `ollama` (qwen3:4b) | ~0.5s | free | `ollama pull qwen3:4b` |
+| `google` (flash) | ~1-2s | ~$0.0001/check | GEMINI_API_KEY |
 | `azure` (gpt-4o) | ~1-2s | pay-per-use | endpoint + key |
 | `azure` (gpt-5.2) | ~2s | pay-per-use | endpoint + key |
 | `anthropic` (haiku) | ~1-2s | ~$0.001/check | API key |
@@ -271,17 +287,41 @@ cd ~/dev/dedelulu
 - You can always type into the terminal yourself — dedelulu backs off
 - Hooks are auto-removed on exit (original settings restored)
 
-## LLM Conversations: `ddll ask` and `ddll send`
+## LLM Conversations: `ddll ask`, `ddll run`, and `ddll send`
 
-Talk to external LLMs (GPT-5.4, Ollama models, etc.) directly from the terminal
-or from within any dedelulu-managed agent. Conversations can be ephemeral or
-persistent, and files can be injected as context.
+Talk to AI agents and LLM APIs directly from the terminal. `ddll ask`, `ddll run`,
+and `ddll send` are all equivalent for CLI agents — they launch the agent in
+full-auto (yolo) mode. For API endpoints, they make HTTP calls.
+
+### Two kinds of targets
+
+**CLI agents** — launch a real CLI process in yolo mode:
+
+| Target | Binary | Command |
+|--------|--------|---------|
+| `gemini` | `gemini` | `gemini --yolo -p "task"` |
+| `codex` | `codex` | `codex exec --yolo "task"` |
+| `claude` | `claude` | `claude -p --dangerously-skip-permissions "task"` |
+
+**API endpoints** — HTTP calls, no process spawned:
+
+| Target | Provider | Default model |
+|--------|----------|---------------|
+| `gpt54` | Azure OpenAI | gpt-5.4 |
+| `gemini-api` | Google Gemini | gemini-2.5-flash |
+| Custom | Via `DDLL_LLM_*` env vars | configurable |
 
 ### Quick examples
 
 ```bash
-# One-off question
+# CLI agents — full-auto mode
+ddll ask gemini "add tests for the auth module"
+ddll ask codex "fix the failing tests"
+ddll ask claude "refactor auth to use JWT"
+
+# API endpoints — quick Q&A
 ddll ask gpt54 "what's the best way to structure a Z80 parser?"
+ddll ask gemini-api "explain this error message"
 
 # Persistent session — LLM remembers context across messages
 ddll ask gpt54 -s review "my name is Alice, I'm reviewing auth code"
@@ -295,9 +335,42 @@ ddll ask gpt54 --file src/auth.py "review this for security issues"
 # Pipe from stdin
 git diff | ddll ask gpt54 "review this diff"
 
-# From another agent via messaging fabric
+# From another agent via messaging fabric (response routed back via IPC)
 ddll send gpt54 "is this the right approach for error handling?"
+ddll send gemini "review @src/handler.go for security issues"
 ```
+
+### Verified results: CLI agents writing files
+
+All three CLI agents were tested with `ddll ask <agent> "write 'hello from <agent>' into /tmp/test.txt"`:
+
+```
+$ ddll ask claude "write 'hello from claude' into /tmp/ddll_test_claude.txt"
+[claude]
+Done. The file /tmp/ddll_test_claude.txt has been created.
+
+$ cat /tmp/ddll_test_claude.txt
+hello from claude
+
+$ ddll ask codex "write 'hello from codex' into /tmp/ddll_test_codex.txt"
+[codex]
+Wrote 'hello from codex' to /tmp/ddll_test_codex.txt and verified the contents.
+
+$ cat /tmp/ddll_test_codex.txt
+hello from codex
+
+$ ddll ask gemini "write 'hello from gemini' into /tmp/ddll_test_gemini.txt"
+[gemini]
+I cannot write to /tmp/ddll_test_gemini.txt because it is outside the
+allowed workspace. Wrote to ~/.gemini/tmp/project/ddll_test_gemini.txt instead.
+
+$ cat ~/.gemini/tmp/project/ddll_test_gemini.txt
+hello from gemini
+```
+
+Note: Gemini CLI enforces its own workspace sandbox even in yolo mode —
+it auto-approves tool calls but still restricts writes to its workspace
+directory. Claude and Codex write to the requested path directly.
 
 ### How it works
 

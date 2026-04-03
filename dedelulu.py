@@ -748,11 +748,12 @@ class LLMRegistry:
             deployment=os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-5.4'),
         )
 
-        # Built-in: gemini → Google Gemini 2.5 Flash
+        # Built-in: gemini-api → Google Gemini 2.5 Flash (HTTP API)
+        # "gemini" (no suffix) is reserved for Gemini CLI wrapper
         gemini_key = os.getenv('GEMINI_API_KEY', '')
         if gemini_key:
-            endpoints['gemini'] = LLMEndpoint(
-                name='gemini',
+            endpoints['gemini-api'] = LLMEndpoint(
+                name='gemini-api',
                 provider='google',
                 model='gemini-2.5-flash',
                 api_key=gemini_key,
@@ -1634,6 +1635,17 @@ class Registry:
         if target == 'all':
             return live
 
+        # Check if target is a CLI agent (gemini, codex, claude)
+        _CLI_AGENT_NAMES = {'gemini', 'codex', 'claude'}
+        if target in _CLI_AGENT_NAMES:
+            return [{
+                'type': 'cli_agent',
+                'agent_name': target,
+                'worker_name': target,
+                'session_id': 'cli',
+                'alive': True,
+            }]
+
         # Check if target is an LLM endpoint (before worker matching)
         llm = LLMRegistry.find(target)
         if llm:
@@ -2274,7 +2286,7 @@ class Supervisor:
 
         # Hooks state
         self._use_hooks = (not no_hooks
-                           and command and command[0] in ('claude', 'claude-code'))
+                           and command and command[0] in ('claude', 'claude-code', 'gemini', 'gemini-code', 'gemini-cli'))
         self._settings_backup = None
         self._settings_path = None
         self._state_file = None  # temp file for PostToolUse state
@@ -2286,9 +2298,18 @@ class Supervisor:
             set_log_ipc(self.ipc)
 
     def _install_hooks(self):
-        """Install Claude Code hooks for auto-approval and supervisor."""
-        settings_dir = os.path.join(os.getcwd(), '.claude')
+        """Install agent hooks (Claude Code or Gemini CLI) for auto-approval and supervisor."""
+        is_gemini = self.command and self.command[0].startswith('gemini')
+        settings_dir_name = '.gemini' if is_gemini else '.claude'
+        settings_dir = os.path.join(os.getcwd(), settings_dir_name)
         self._settings_path = os.path.join(settings_dir, 'settings.local.json')
+
+        # Ensure directory exists before backup/install
+        if not os.path.exists(settings_dir):
+            try:
+                os.makedirs(settings_dir, exist_ok=True)
+            except Exception:
+                pass
 
         # Backup existing settings
         if os.path.exists(self._settings_path):
@@ -2743,8 +2764,10 @@ class Supervisor:
 
     # Patterns that indicate the agent is done and waiting for user input (don't nudge)
     _AGENT_WAITING_PATTERNS = [
-        re.compile(r'❯\s*$'),                          # Claude Code prompt
+        re.compile(r'❯\s*$'),                          # Claude Code / Gemini prompt
         re.compile(r'^\s*>\s*$', re.MULTILINE),         # generic prompt
+        re.compile(r'\?\s*$'),                          # Gemini / generic question prompt
+        re.compile(r'Enter\s+your\s+question', re.IGNORECASE), # Gemini CLI
         re.compile(r'Cogitated\s+for', re.IGNORECASE),  # Claude Code "Cogitated for Xm Ys"
         re.compile(r'↓\s+to\s+manage'),                 # Claude Code "↓ to manage"
         re.compile(r'tab\s+to\s+amend', re.IGNORECASE), # Claude Code waiting for next prompt
@@ -3307,8 +3330,8 @@ def main():
         sys.argv = [sys.argv[0]] + sys.argv[2:]  # strip 'send' so send_main sees target+msg
         send_main()
         sys.exit(0)
-    if len(sys.argv) >= 2 and sys.argv[1] == 'ask':
-        sys.argv = [sys.argv[0]] + sys.argv[2:]  # strip 'ask' so ask_main sees llm+question
+    if len(sys.argv) >= 2 and sys.argv[1] in ('ask', 'run'):
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
         ask_main()
         sys.exit(0)
     # Foreman mode: dedelulu --foreman <ipc_dir>
@@ -3392,7 +3415,7 @@ with system instructions (put dedelulu flags BEFORE the command):
     parser.add_argument('--idle', type=float, default=4.0,
                         help='seconds of silence before checking for prompt (default: 4)')
     parser.add_argument('--provider',
-                        choices=['none', 'claude-cli', 'anthropic', 'ollama', 'openai', 'azure'],
+                        choices=['none', 'claude-cli', 'anthropic', 'ollama', 'openai', 'azure', 'google', 'gemini'],
                         default=None,
                         help='LLM provider for supervisor & ambiguous prompts '
                              '(default: azure if env vars set, else none)')
@@ -3495,12 +3518,22 @@ with system instructions (put dedelulu flags BEFORE the command):
     if not command:
         parser.error('no command specified')
 
-    # Auto-extract goal from command if wrapping claude and no explicit --goal
+    # Auto-extract goal from command if wrapping claude/gemini and no explicit --goal
     goal = args.goal
-    if not goal and len(command) >= 2 and command[0] in ('claude', 'claude-code'):
-        non_flag_args = [a for a in command[1:] if not a.startswith('-')]
-        if non_flag_args:
-            goal = ' '.join(non_flag_args)
+    if not goal and len(command) >= 2 and (command[0].startswith('claude') or command[0].startswith('gemini')):
+        if command[0].startswith('gemini'):
+            # Check for -p "task"
+            try:
+                p_idx = command.index('-p')
+                if p_idx + 1 < len(command):
+                    goal = command[p_idx + 1]
+            except ValueError:
+                pass
+        
+        if not goal:
+            non_flag_args = [a for a in command[1:] if not a.startswith('-')]
+            if non_flag_args:
+                goal = ' '.join(non_flag_args)
 
     # If goal provided but no supervise interval, default to 120s
     # (unless style explicitly set supervise to 0, e.g. passive/auto)
@@ -3709,6 +3742,63 @@ def send_main():
             print(f"  {w['session_id'][:8]}:{w['worker_name']}", file=sys.stderr)
 
     for w in matches:
+        if w.get('type') == 'cli_agent':
+            # Launch CLI agent in yolo mode, capture output
+            import shutil, subprocess
+            agent_name = w['agent_name']
+            _cli_configs = {
+                'gemini': {'binary': 'gemini', 'args': ['--yolo', '-p']},
+                'codex': {'binary': 'codex', 'args': ['exec', '--yolo']},
+                'claude': {'binary': 'claude', 'args': ['-p', '--dangerously-skip-permissions']},
+            }
+            cfg = _cli_configs.get(agent_name)
+            if not cfg:
+                print(f"error: unknown CLI agent '{agent_name}'", file=sys.stderr)
+                continue
+            binary = shutil.which(cfg['binary'])
+            if not binary:
+                print(f"error: '{cfg['binary']}' not found on PATH", file=sys.stderr)
+                continue
+
+            # File injection
+            parts = message.split()
+            clean_parts, inline_files = _extract_inline_files(parts)
+            effective_msg = ' '.join(clean_parts)
+            if inline_files:
+                file_ctx = _read_context_files(inline_files)
+                effective_msg = f"{file_ctx}\n\n{effective_msg}"
+
+            cmd = [binary] + cfg['args'] + [effective_msg]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                         timeout=120)
+                response = result.stdout.strip() or result.stderr.strip()
+            except subprocess.TimeoutExpired:
+                print(f"error: {agent_name} timed out", file=sys.stderr)
+                continue
+            except Exception as e:
+                print(f"error: {agent_name}: {e}", file=sys.stderr)
+                continue
+
+            if not response:
+                print(f"error: {agent_name} returned no output", file=sys.stderr)
+                continue
+
+            # Route response back via IPC if sender is a dedelulu worker
+            if prefer_session:
+                sender_matches = Registry.find_target(
+                    worker_name, prefer_session=prefer_session)
+                sender_matches = [m for m in sender_matches
+                                  if m.get('type') not in ('llm', 'cli_agent')]
+                if sender_matches:
+                    sender_ipc = IPC(sender_matches[0]['ipc_dir'])
+                    sender_ipc.send_input(response, sender=agent_name)
+                    print(f"[{agent_name}] responded "
+                          f"({len(response)} chars) → {sender}")
+                    continue
+            print(f"[{agent_name}]: {response}")
+            continue
+
         if w.get('type') == 'llm':
             # Synchronous LLM call
             endpoint = w['llm_endpoint']
@@ -3801,12 +3891,67 @@ def ask_main():
 
     args = parser.parse_args()
 
-    # Resolve LLM endpoint
+    # CLI agents: gemini, claude — launch binary instead of API call
+    # CLI agents run in full-auto (yolo) mode — ddll ask = ddll run for these
+    CLI_AGENTS = {
+        'gemini': {'binary': 'gemini', 'args': ['--yolo', '-p']},
+        'codex': {'binary': 'codex', 'args': ['exec', '--yolo']},
+        'claude': {'binary': 'claude', 'args': ['-p', '--dangerously-skip-permissions']},
+    }
+
+    if args.llm in CLI_AGENTS:
+        import shutil, subprocess
+        agent = CLI_AGENTS[args.llm]
+        binary = shutil.which(agent['binary'])
+        if not binary:
+            print(f"error: '{agent['binary']}' not found on PATH. "
+                  f"Install it first.", file=sys.stderr)
+            sys.exit(1)
+
+        # Build question with file injection
+        if not args.question:
+            if not sys.stdin.isatty():
+                question = sys.stdin.read().strip()
+            else:
+                print("error: no question provided", file=sys.stderr)
+                sys.exit(1)
+            all_files = list(args.files)
+        else:
+            clean_parts, inline_files = _extract_inline_files(args.question)
+            question = ' '.join(clean_parts)
+            all_files = list(args.files) + inline_files
+
+        if all_files:
+            file_context = _read_context_files(all_files)
+            question = f"{file_context}\n\n{question}"
+
+        cmd = [binary] + agent['args'] + [question]
+        print(f"[{args.llm}] ", end='', file=sys.stderr)
+        print(file=sys.stderr)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                     timeout=120)
+            if result.stdout.strip():
+                print(result.stdout.strip())
+            elif result.stderr.strip():
+                print(result.stderr.strip(), file=sys.stderr)
+            else:
+                print("error: no output", file=sys.stderr)
+        except subprocess.TimeoutExpired:
+            print("error: timed out after 120s", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    # Resolve LLM endpoint (API-based: gpt54, gemini-api, etc.)
     endpoint = LLMRegistry.find(args.llm)
     if not endpoint:
         available = [e.name for e in LLMRegistry.discover()]
-        print(f"error: unknown LLM '{args.llm}' "
-              f"(available: {', '.join(available) or 'none configured'})",
+        cli_names = list(CLI_AGENTS.keys())
+        print(f"error: unknown target '{args.llm}' "
+              f"(available: {', '.join(cli_names + available) or 'none configured'})",
               file=sys.stderr)
         sys.exit(1)
 

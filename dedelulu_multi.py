@@ -437,7 +437,7 @@ def _handle_command(raw: str, session: Session, worker_color: dict,
 # tmux launcher for multi-worker
 # =============================================================================
 
-def launch_multi_tmux(session: Session, extra_args: list[str]):
+def launch_multi_tmux(session: Session, agent: str, extra_args: list[str]):
     """Launch multi-worker tmux session."""
     tmux = shutil.which('tmux')
     if not tmux:
@@ -454,13 +454,15 @@ def launch_multi_tmux(session: Session, extra_args: list[str]):
     # Build worker commands
     worker_cmds = []
     for w in workers:
+        agent_parts = [agent]
+        if agent.startswith('gemini'):
+            agent_parts = [agent, '-p']
+
         cmd_parts = [
             python, dedelulu_bin,
             '--ipc-dir', w.ipc_dir,
             '--no-tmux',
-        ] + extra_args + [
-            'claude', w.task,
-        ]
+        ] + extra_args + agent_parts + [w.task]
         worker_cmds.append((w, ' '.join(shlex.quote(a) for a in cmd_parts)))
 
     # Foreman command
@@ -555,8 +557,11 @@ examples:
     parser.add_argument('--worker', action='append', required=True,
                         metavar='"name:dir:task"',
                         help='worker spec as "name:directory:task description" (repeat for each worker)')
+    parser.add_argument('--agent', choices=['claude', 'claude-code', 'gemini', 'gemini-cli', 'gemini-code'],
+                        default='claude',
+                        help='agent CLI to wrap (default: claude)')
     parser.add_argument('--provider',
-                        choices=['none', 'claude-cli', 'anthropic', 'ollama', 'openai', 'azure'],
+                        choices=['none', 'claude-cli', 'anthropic', 'ollama', 'openai', 'azure', 'google', 'gemini'],
                         default='none',
                         help='LLM provider for supervisor')
     parser.add_argument('--model', help='specific model for supervisor')
@@ -610,7 +615,7 @@ examples:
         extra_args += ['--log', args.log]
 
     # Launch tmux
-    launch_multi_tmux(session, extra_args)
+    launch_multi_tmux(session, args.agent, extra_args)
 
 
 if __name__ == '__main__':

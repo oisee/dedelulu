@@ -21,7 +21,10 @@ ollama pull qwen3:4b   # run on the ollama machine
 # Option C: Anthropic API
 export ANTHROPIC_API_KEY=sk-ant-...
 
-# Option D: Another Claude Code instance (from regular terminal only)
+# Option D: Google Gemini (fast, affordable)
+export GEMINI_API_KEY=your-api-key-from-ai-studio
+
+# Option E: Another Claude Code instance (from regular terminal only)
 # No setup needed — uses your Max subscription
 
 # 3. Verify it works
@@ -157,14 +160,17 @@ dedelulu --dry-run --idle 6 \
 dedelulu --provider azure \
   claude "delete all unused dependencies and clean up imports"
 ```
+## Use Case 6: Gemini and other CLI tools
 
-## Use Case 6: Non-Claude CLI tools
-
-dedelulu works with any interactive CLI, not just Claude Code.
+dedelulu works with any interactive CLI. It has first-class support for the `gemini` CLI, including goal extraction and hook-based auto-approval.
 
 ```bash
+# Wrap gemini CLI
+dedelulu gemini -p "implement a JWT auth module"
+
 # npm/yarn
 dedelulu npm init
+...
 dedelulu npx create-next-app my-app
 
 # git interactive
@@ -224,10 +230,10 @@ The foreman pane shows real-time events and accepts commands:
 - Try `--dry-run` to see pattern matches without sending
 
 ### Hooks not working
-- Check `.claude/settings.local.json` was created
+- Check `.claude/settings.local.json` or `.gemini/settings.local.json` was created
 - Use `--no-hooks` to fall back to PTY-only mode
 - Hooks are auto-removed on exit; if dedelulu crashed, manually
-  restore `.claude/settings.local.json`
+  restore the `settings.local.json` file.
 
 ### Supervisor keeps intervening unnecessarily
 - Increase `--supervise` interval (e.g., 120 seconds)
