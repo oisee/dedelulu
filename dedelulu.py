@@ -2620,9 +2620,12 @@ class Supervisor:
                         sender = msg.get('sender', 'foreman')
                         try:
                             formatted = self._format_agent_message(response_text, sender=sender)
-                            os.write(self.master_fd, (formatted + '\r').encode())
-                            # Claude Code collapses long pastes into "[pasted text]"
-                            # and waits for Enter — send an extra \r after a short delay
+                            # Write message WITHOUT trailing \r — if Claude Code
+                            # collapses it into [pasted text], a \r inside the paste
+                            # gets swallowed. Send Enter separately after.
+                            os.write(self.master_fd, formatted.encode())
+                            time.sleep(0.5)
+                            os.write(self.master_fd, b'\r')
                             self._flush_and_nudge_paste()
                         except OSError:
                             pass
@@ -2937,7 +2940,8 @@ class Supervisor:
         """After writing a message to the PTY, check if Claude Code collapsed it
         into '[pasted text]' and send an extra Enter if so.
 
-        Claude Code takes variable time to render — poll for up to 2s."""
+        Claude Code renders [pasted text] with ANSI codes, so we strip
+        them before checking. Poll for up to 2s."""
         deadline = time.monotonic() + 2.0
         found_paste = False
         time.sleep(0.3)  # initial settle time
@@ -2954,8 +2958,9 @@ class Supervisor:
                     break
                 os.write(sys.stdout.fileno(), data)  # passthrough
                 text = data.decode('utf-8', errors='replace')
+                clean = strip_ansi(text).lower()
                 self._buffer_output(strip_ansi(text))
-                if 'pasted text' in text.lower():
+                if 'pasted text' in clean or 'pasted' in clean:
                     found_paste = True
                     break
             if found_paste:
@@ -3021,7 +3026,9 @@ class Supervisor:
             time.sleep(1)
             try:
                 formatted = self._format_agent_message(message)
-                os.write(self.master_fd, (formatted + '\r').encode())
+                os.write(self.master_fd, formatted.encode())
+                time.sleep(0.5)
+                os.write(self.master_fd, b'\r')
                 self._flush_and_nudge_paste()
             except OSError:
                 pass
@@ -3036,7 +3043,9 @@ class Supervisor:
                 f"[dedelulu] {label}: {reasoning or message[:60]}", 'info')
             try:
                 formatted = self._format_agent_message(message)
-                os.write(self.master_fd, (formatted + '\r').encode())
+                os.write(self.master_fd, formatted.encode())
+                time.sleep(0.5)
+                os.write(self.master_fd, b'\r')
                 self._flush_and_nudge_paste()
             except OSError:
                 pass
