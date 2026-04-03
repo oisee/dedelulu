@@ -15,58 +15,79 @@ pip install -e .
 ## Quick start
 
 ```bash
-# Just auto-approve everything — no API keys needed
-dedelulu claude "add tests for the auth module"
+# Auto-approve everything — no API keys needed, no panel, just hooks
+ddll claude "add tests for the auth module"
 
-# With supervisor — watches for derailing
-dedelulu --provider azure claude "add tests for the auth module"
+# Run any AI agent in yolo mode
+ddll ask gemini "refactor auth to use JWT"
+ddll ask codex "fix the failing tests"
+ddll ask claude "add logging to the API"
 
-# Talk to external LLMs
+# Talk to LLM APIs
 ddll ask gpt54 "review @src/auth.py for security issues"
+ddll ask gemini-api "explain this error"
+
+# With supervisor (opt-in)
+ddll --provider azure --supervise 60 claude "big refactor"
 
 # Multi-worker — two agents collaborating
 dedelulu-multi \
   --worker "api:.:implement CRUD endpoints" \
-  --worker "tests:.:write pytest tests" \
-  --provider azure
+  --worker "tests:.:write pytest tests"
 ```
 
 That's it. Open a terminal, cd to your project, run the command.
-dedelulu auto-splits tmux (top: Claude, bottom: foreman),
-installs Claude Code hooks for instant approval, and logs every decision.
+Hooks auto-approve, IPC messaging works, full-screen agent — no noise.
 
 ## How it works
 
 ```
-dedelulu claude "your task"
+ddll claude "your task"
   │
-  ├── installs Claude Code hooks (.claude/settings.local.json)
+  ├── shows cheat-sheet (ddll send/ask/explore hints)
+  │
+  ├── installs hooks (.claude/settings.local.json or .gemini/)
   │     PreToolUse  → auto-approve (no prompt shown)
-  │     PostToolUse → log tool actions to foreman
-  │     Stop        → supervisor check when Claude pauses
+  │     PostToolUse → log tool actions
+  │     Stop        → supervisor check (if enabled)
   │
-  ├── spawns claude in PTY (full passthrough, you see everything)
-  │     PTY patterns catch non-Claude prompts (npm, git, pip)
+  ├── spawns agent in full-screen PTY (you see everything)
+  │     no panel, no banners, no noise — just the agent
   │
-  ├── tmux auto-split (if tmux available)
-  │     top pane  = Claude Code (you watch / type)
-  │     bottom    = foreman (status, logs, escalations)
+  ├── IPC messaging active (ddll send/ask from other agents)
   │
-  └── optional supervisor (--provider):
-        every N seconds, asks cheap LLM:
-        ├── on_track   → continue (logged)
-        ├── off_rails  → Ctrl+C + redirect message
-        ├── stuck      → Ctrl+C + interrupt
-        └── uncertain  → ESCALATE: ask human (BEL + pause)
+  └── opt-in features:
+        --tmux          → foreman panel (status, logs, escalations)
+        --no-hooks      → PTY pattern matching (y/n, npm, git prompts)
+        --provider X    → LLM supervisor health checks
+        --stale N       → nudge idle agents
+        --style active  → enable supervisor + stale together
 ```
 
-**Three layers:**
+**Default mode: hooks-only.** dedelulu installs Claude Code hooks and
+auto-approves everything. No patterns, no LLM, no panel, no noise.
+Just a transparent pipe that says "yes" to every tool call.
+
+Everything else is opt-in:
+
+| Feature | Default | Enable with |
+|---------|---------|-------------|
+| Hook auto-approval | **on** | always (use `--no-hooks` to disable) |
+| Pattern matching (y/n, Enter) | off | `--no-hooks` (PTY-only mode) |
+| LLM supervisor | off | `--provider azure --supervise 60` |
+| Stale nudge | off | `--stale 300` |
+| Tmux foreman panel | off | `--tmux` |
+| IPC messaging (ddll send) | **on** | always |
+
+Or use presets: `--style active` (supervisor + stale), `--style strict` (short leash).
+
+**Three layers (when enabled):**
 
 | Layer | What it does | LLM needed? |
 |-------|-------------|-------------|
-| Hooks | Claude Code PreToolUse auto-approve | No |
-| Doorman | PTY pattern-match for non-Claude prompts | No |
-| Supervisor | Periodically checks if agent is on track | Yes (cheap model) |
+| Hooks | Claude Code / Gemini CLI PreToolUse auto-approve | No |
+| Doorman | PTY pattern-match for non-Claude prompts (`--no-hooks`) | No |
+| Supervisor | Periodically checks if agent is on track (`--provider`) | Yes (cheap model) |
 
 ## Usage
 
@@ -131,17 +152,19 @@ dedelulu-multi \
 ### Options
 
 ```
---idle SECS         Seconds of silence before auto-responding (default: 4)
+--style PRESET      auto (default) | passive | active | strict
+--tmux              Enable foreman panel (off by default)
+--no-hooks          Disable hooks, use PTY pattern matching instead
 --provider          LLM for supervisor: none|ollama|anthropic|openai|azure|google|gemini|claude-cli
---model MODEL       Specific model (default: gpt-4o for azure, qwen3:4b for ollama, gemini-2.5-flash for google)
---goal GOAL         What the agent should accomplish (auto-extracted from claude command)
---supervise SECS    Supervisor check interval (default: 60s when provider is set)
+--model MODEL       Specific model (default: gpt-4o for azure, gemini-2.5-flash for google)
+--supervise SECS    Supervisor check interval (0=off, try 30-120)
+--stale SECS        Nudge idle agent after N seconds (0=off)
+--goal GOAL         What the agent should accomplish (auto-extracted from command)
+--idle SECS         Silence threshold for PTY pattern matching (default: 4, only with --no-hooks)
 --dry-run           Detect prompts but don't send responses
 --log FILE          Log file path (default: dedelulu.jsonl)
 --no-log            Disable logging
 --max-responses N   Stop auto-approving after N responses (0=unlimited)
---no-hooks          Disable Claude Code hooks (PTY-only mode)
---no-tmux           Single-pane mode, no tmux split
 ```
 
 ### Environment variables
