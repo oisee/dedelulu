@@ -201,6 +201,45 @@ For CLI agents, session history is concatenated into the prompt
 5. **Phase 4**: Agent discovery in `ddll explore`
 6. **Phase 5**: Sandbox levels, copilot/gemini-cli backends
 
+## Default Launch Mode
+
+When running `ddll claude "task"` (or just `ddll claude`):
+
+**No tmux panel by default.** Full screen for the agent. The foreman log panel
+is hidden — hooks handle approval silently in the background.
+
+Before launching the agent, show a brief cheat-sheet:
+
+```
+┌─────────────────────────────────────────────────┐
+│  dedelulu v0.2 — hooks active, auto-approving   │
+│                                                  │
+│  Ctrl+T  toggle foreman panel                    │
+│  Ctrl+H  show this help                          │
+│  Ctrl+L  show log tail                           │
+│  ddll send <target> "msg"  message other agents  │
+│  ddll explore              list workers + LLMs   │
+└─────────────────────────────────────────────────┘
+```
+
+Then launch the agent in full-screen PTY.
+
+**What runs silently:**
+- Hooks: PreToolUse auto-approve, PostToolUse logging, Stop check
+- IPC: message forwarding (ddll send/ask responses delivered to PTY)
+
+**What does NOT write to PTY:**
+- Supervisor verdicts ("on track", "stuck", etc.) — only logged to file
+- Notifications — only shown if panel is toggled on
+- No `[dedelulu]` banners mid-typing
+
+**Toggling the panel:** Ctrl+T splits tmux and shows the foreman log.
+Ctrl+T again hides it. Panel shows full supervisor output, events, IPC.
+
+**Escalation override:** If supervisor detects `uncertain` or `escalate`,
+it DOES interrupt — BEL + message. This is the only case where dedelulu
+writes to PTY in default mode.
+
 ## Non-Goals
 
 - Not building a new agent framework — just wrapping existing CLIs
