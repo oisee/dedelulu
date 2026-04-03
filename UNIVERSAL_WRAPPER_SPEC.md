@@ -91,8 +91,8 @@ ddll send claude "is this approach correct? @src/handler.go"
 
 | Level | Claude flags | Codex flags | Gemini flags | What agent can do |
 |-------|-------------|-------------|-------------|-------------------|
-| `read-only` (default for ask) | `--allowedTools "Read,Glob,Grep"` | (default sandbox) | `--approval-mode=plan` | Read files, search code |
-| `read-write` | `--allowedTools "Read,Edit,Write,Glob,Grep"` | `--full-auto` | `--approval-mode=auto_edit` | Read + edit files |
+| `read-only` (default for ask) | `--allowedTools "Read,Glob,Grep" --bare` | (default sandbox) | `--approval-mode=plan` | Read files, search code |
+| `read-write` | `--allowedTools "Read,Edit,Write,Glob,Grep" --bare` | `--full-auto` | `--approval-mode=auto_edit` | Read + edit files |
 | `full` | `--allowedTools "Bash,Read,Edit,Write,Glob,Grep"` | `--full-auto` | `--approval-mode=yolo -s` | Everything, sandboxed |
 | `yolo` | `--dangerously-skip-permissions` | `--yolo` | `--approval-mode=yolo` | No restrictions |
 
@@ -129,7 +129,7 @@ class AgentRegistry:
         'claude': {
             'binary': 'claude',
             'version_cmd': 'claude --version',
-            'chat_cmd': lambda q, tools: ['claude', '-p', q, '--allowedTools', tools],
+            'chat_cmd': lambda q, tools: ['claude', '-p', q, '--bare', '--allowedTools', tools],
             'auto_cmd': lambda task: ['dedelulu', '--style', 'auto', 'claude', task],
         },
         'codex': {
@@ -178,6 +178,24 @@ ddll ask gpt54 "summarize @README.md"        # already works (current implementa
 
 For CLI agents (claude, codex), file contents are prepended to the prompt.
 For API agents (gpt54, gemini), injected into the messages array.
+
+## Claude-specific: `--resume` for sessions
+
+Claude Code supports `--resume <session-id>` to continue a previous session
+natively (with full tool context, not just message history). This is superior
+to our JSON-based session persistence for Claude:
+
+```bash
+ddll ask claude -s review "review @src/auth.py"
+# First call: claude -p "..." --bare --allowedTools "Read,Glob,Grep"
+# Captures session-id from output
+
+ddll ask claude -s review "what about the JWT part?"
+# Subsequent calls: claude --resume <session-id> -p "..."
+# Full Claude context preserved (not just message concatenation)
+```
+
+This is a unique Claude advantage — codex and gemini don't have session resume.
 
 ## Session Persistence
 

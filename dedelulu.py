@@ -2912,18 +2912,33 @@ class Supervisor:
 
     def _flush_and_nudge_paste(self):
         """After writing a message to the PTY, check if Claude Code collapsed it
-        into '[pasted text]' and send an extra Enter if so."""
-        time.sleep(0.3)
+        into '[pasted text]' and send an extra Enter if so.
+
+        Claude Code takes variable time to render — poll for up to 2s."""
+        deadline = time.monotonic() + 2.0
+        found_paste = False
+        time.sleep(0.3)  # initial settle time
         try:
-            r, _, _ = select.select([self.master_fd], [], [], 0.5)
-            if r:
+            while time.monotonic() < deadline:
+                remaining = min(deadline - time.monotonic(), 0.5)
+                if remaining <= 0:
+                    break
+                r, _, _ = select.select([self.master_fd], [], [], remaining)
+                if not r:
+                    break
                 data = os.read(self.master_fd, 16384)
+                if not data:
+                    break
                 os.write(sys.stdout.fileno(), data)  # passthrough
-                self._buffer_output(strip_ansi(data.decode('utf-8', errors='replace')))
-                if 'pasted text' in data.decode('utf-8', errors='replace').lower():
-                    # Claude collapsed the paste — send Enter to submit
-                    time.sleep(0.1)
-                    os.write(self.master_fd, b'\r')
+                text = data.decode('utf-8', errors='replace')
+                self._buffer_output(strip_ansi(text))
+                if 'pasted text' in text.lower():
+                    found_paste = True
+                    break
+            if found_paste:
+                # Claude collapsed the paste — send Enter to submit
+                time.sleep(0.5)
+                os.write(self.master_fd, b'\r')
         except Exception:
             pass
 
