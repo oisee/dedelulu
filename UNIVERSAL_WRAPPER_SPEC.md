@@ -240,6 +240,19 @@ Ctrl+T again hides it. Panel shows full supervisor output, events, IPC.
 it DOES interrupt — BEL + message. This is the only case where dedelulu
 writes to PTY in default mode.
 
+## Known Constraints
+
+**Codex CLI + nested namespaces:** Codex uses `bwrap` (bubblewrap) sandbox which
+conflicts with nested Linux namespaces. Running `codex exec` from inside a Claude
+Code Bash tool call will fail. `ddll run codex` must spawn Codex in its own
+terminal/PTY, not nested inside another agent's sandbox. This means:
+- `ddll ask codex` from a standalone terminal: works
+- `ddll send codex` from a dedelulu-supervised Claude Code session: must fork a
+  separate process outside the PTY, not run inside Claude's Bash tool
+
+**Claude Code --dangerously-skip-permissions:** No short alias (unlike Codex `--yolo`).
+Must use the full flag. `ddll run claude --yolo` should translate to the long form.
+
 ## Non-Goals
 
 - Not building a new agent framework — just wrapping existing CLIs
