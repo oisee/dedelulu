@@ -2566,7 +2566,9 @@ class Supervisor:
                         self.idle_handled = True  # don't auto-respond after user input
 
             # Check for idle (prompt auto-response)
-            if not self.idle_handled and self.buffer:
+            # Skip when hooks are active — hooks handle approval,
+            # pattern matching and LLM fallback are not needed
+            if not self._use_hooks and not self.idle_handled and self.buffer:
                 elapsed = time.time() - self.last_output_time
                 if elapsed >= self.idle_seconds:
                     self._handle_idle()
@@ -2574,7 +2576,7 @@ class Supervisor:
             # Ingest hook events into timeline
             self._ingest_hook_timeline()
 
-            # Periodic supervisor health check
+            # Periodic supervisor health check — only if explicitly enabled
             if (self.supervise_interval > 0 and self.goal
                     and self.provider != 'none'):
                 now = time.time()
