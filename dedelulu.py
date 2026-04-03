@@ -2101,6 +2101,23 @@ def launch_tmux(args_list: list[str], session_dir: str, ipc_dir: str):
     os.execvp(tmux, [tmux, 'attach-session', '-t', session_name])
 
 
+def _show_cheatsheet():
+    """Show a brief help banner before launching the agent."""
+    banner = """\x1b[90m
+┌─────────────────────────────────────────────────┐
+│  dedelulu — hooks active, auto-approving        │
+│                                                  │
+│  ddll send <target> "msg"  message other agents  │
+│  ddll ask <llm> "question" ask an LLM            │
+│  ddll explore              list workers + LLMs   │
+│                                                  │
+│  start with --tmux to enable foreman panel       │
+└─────────────────────────────────────────────────┘
+\x1b[0m"""
+    sys.stderr.write(banner)
+    sys.stderr.flush()
+
+
 def _launch_foreman_pane(session_dir: str):
     """When already inside tmux, split a 20% right pane running the foreman."""
     import subprocess
@@ -2213,7 +2230,8 @@ class Supervisor:
                  system_instructions: str = None,
                  stale_timeout: float = 0,
                  session_dir: str = None,
-                 worker_name: str = 'main'):
+                 worker_name: str = 'main',
+                 quiet: bool = False):
         self.command = command
         self.idle_seconds = idle_seconds
         self.provider = provider
@@ -2230,6 +2248,7 @@ class Supervisor:
         self.stale_timeout = stale_timeout  # seconds before nudging a stale agent
         self.session_dir = session_dir      # session dir for multi-agent discovery
         self.worker_name = worker_name      # this worker's name in the session
+        self.quiet = quiet                  # suppress PTY notifications (except escalation)
 
         self.master_fd = None
         self.child_pid = None
@@ -3093,7 +3112,17 @@ RULES:
     }
 
     def _notify(self, msg: str, level: str = 'info'):
-        """Print a supervisor message with appropriate urgency."""
+        """Print a supervisor message with appropriate urgency.
+
+        In quiet mode (default), only 'alert' and 'escalate' write to PTY.
+        All levels still forward to IPC/foreman.
+        """
+        # Always forward to foreman via IPC (panel may be toggled on later)
+        if self.ipc:
+            self.ipc.send_event('notify', msg=msg, level=level)
+        # In quiet mode, only escalation/alert writes to PTY
+        if self.quiet and level not in ('alert', 'escalate'):
+            return
         try:
             style = self._NOTIFY_STYLES.get(level, '\x1b[90m')
             bel = '\x07' if level in ('alert', 'escalate') else ''
@@ -3102,9 +3131,6 @@ RULES:
             sys.stderr.buffer.flush()
         except Exception:
             pass
-        # Forward to foreman via IPC
-        if self.ipc:
-            self.ipc.send_event('notify', msg=msg, level=level)
 
 
 # =============================================================================
@@ -3373,8 +3399,10 @@ with system instructions (put dedelulu flags BEFORE the command):
                              '(default: 0=off, try 30-120)')
     parser.add_argument('--no-hooks', action='store_true',
                         help='disable Claude Code hooks (use PTY-only mode)')
-    parser.add_argument('--no-tmux', action='store_true',
-                        help='single-pane mode, no tmux split')
+    parser.add_argument('--no-tmux', action='store_true', default=True,
+                        help='single-pane mode, no tmux split (default)')
+    parser.add_argument('--tmux', action='store_true',
+                        help='enable tmux foreman panel (off by default)')
     parser.add_argument('--llm-only', action='store_true',
                         help='skip pattern matching, let LLM decide every response')
     parser.add_argument('--system', metavar='TEXT',
@@ -3442,12 +3470,6 @@ with system instructions (put dedelulu flags BEFORE the command):
             args.provider = 'azure'
         else:
             args.provider = 'none'
-            sys.stderr.write(
-                "\x1b[33m[dedelulu] AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT not set.\n"
-                "  Running without LLM supervisor (pattern-only).\n"
-                "  To enable: export AZURE_OPENAI_API_KEY=... AZURE_OPENAI_ENDPOINT=...\n"
-                "  Or use: --provider ollama / --provider anthropic\x1b[0m\n"
-            )
 
     log_path = None if args.no_log else args.log
 
@@ -3493,23 +3515,15 @@ with system instructions (put dedelulu flags BEFORE the command):
     elif args.log != 'dedelulu.jsonl':
         extra_args += ['--log', args.log]
 
-    # tmux auto-split: launch in tmux if not already there and not disabled
-    if not args.no_tmux and not args.ipc_dir and not os.environ.get('TMUX'):
-        # Create session (first worker)
-        session = Session.create(
-            name=args.name, directory=os.getcwd(),
-            task=goal or ' '.join(command),
-            system_instructions=args.system or '',
-            extra_args=extra_args,
-        )
-        w = session.workers[args.name]
-        # Rebuild args for the worker
-        worker_args = sys.argv[1:]
-        launch_tmux(worker_args, session.session_dir, w.ipc_dir)
-        # launch_tmux does execvp, so we only get here if tmux not found
-        args.ipc_dir = None
-    elif not args.no_tmux and not args.ipc_dir and os.environ.get('TMUX'):
-        # Already inside tmux — create session, split foreman pane
+    # --tmux explicitly requested overrides --no-tmux default
+    want_tmux = args.tmux and not args.no_tmux if hasattr(args, 'tmux') else not args.no_tmux
+    # Backward compat: if user passed --no-tmux explicitly, honor it
+    # New default: no panel unless --tmux is passed
+    if not args.tmux:
+        want_tmux = False
+
+    # Create session + IPC regardless (needed for messaging even without panel)
+    if not args.ipc_dir:
         session = Session.create(
             name=args.name, directory=os.getcwd(),
             task=goal or ' '.join(command),
@@ -3519,7 +3533,18 @@ with system instructions (put dedelulu flags BEFORE the command):
         w = session.workers[args.name]
         args.ipc_dir = w.ipc_dir
         args.session_dir = session.session_dir
-        _launch_foreman_pane(session.session_dir)
+
+        if want_tmux:
+            worker_args = sys.argv[1:]
+            if not os.environ.get('TMUX'):
+                launch_tmux(worker_args, session.session_dir, w.ipc_dir)
+                args.ipc_dir = None
+            else:
+                _launch_foreman_pane(session.session_dir)
+
+    if not want_tmux and not os.environ.get('DEDELULU_WORKER'):
+        # Default: no panel — show cheat-sheet before launching
+        _show_cheatsheet()
 
     sup = Supervisor(
         command=command,
@@ -3539,6 +3564,7 @@ with system instructions (put dedelulu flags BEFORE the command):
         stale_timeout=args.stale,
         session_dir=getattr(args, 'session_dir', None),
         worker_name=args.name,
+        quiet=not want_tmux,
     )
 
     exit_code = sup.start()
